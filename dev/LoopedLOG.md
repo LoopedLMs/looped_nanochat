@@ -4,6 +4,39 @@ Running log of experiments on the looped (depth-recurrent) transformer, forked f
 
 **Goal:** Exploratory work on understanding looped LLM behavior from the ground up. Small model sizes, limited compute budget, single runs for quick iteration. The end goal is a model with true dynamic compute and meaningful depth scaling at reasonable cost.
 
+## 2026-02-15: Training-Free Early Exit — Sampled Models Exit Cleanly
+
+-> See branch "gating" for implementation
+
+Tested zero-shot early-exit gating on the four S20 SFT models from 2026-02-13 (r4_fixed, r4_sample, r6_fixed, r6_sample). Three training-free gates evaluated: 
+1. **Relative L2** - normalized state change between consecutive loops
+2. **KL Divergence** - output distribution shift
+3. **Acceleration** - Pappone et al., 2025; normalized second-order convergence with a two-hit confirmation rule. 
+
+Each gate monitors per-token convergence and exits early when the signal drops below a threshold. Minimum exit depth is 3 (need at least two state differences for all gates). Evaluated on val BPB (at native depth and extrapolated to r=12).
+
+### Results
+
+**Sampled models gate well, fixed models don't.** Sampled models (r4_sample, r6_sample) give smooth Pareto curves — BPB degrades gradually as the threshold tightens, saving 20–40% of FLOPs with little quality loss. Fixed models hang onto max depth much longer before the gate fires, then drop off steeply. Their convergence is too sharp for smooth threshold control, consistent with the spiky convergence trajectories from 2026-02-13.
+
+**Free compute at native depth.** At their training depth, sampled models are nearly converged before the last iteration. r4_sample exits at mean depth ~3.8 (of 4) with <0.001 BPB loss at relative_l2=0.1. r6_sample exits at ~4.4 (of 6) — ~25% of recurrent FLOPs saved for free. With so few iterations available, exit depth distributions are narrow (std ~0.2–0.4).
+
+**Extrapolation (r=12) — no quality gain from extra depth.** With 12 iterations available, sampled models don't improve over their train_r BPB — the extra depth is wasted (consistent with 2026-02-13). The gates correctly skip it: r4_sample at relative_l2=0.1 exits at mean depth ~4.1, recovering train_r performance. The depth histograms show multimodal distributions — tokens spread across a range of exit depths rather than clustering at one point. Whether this per-token variation reflects meaningful adaptation or just differences in convergence speed is unclear. Fixed models waste more compute before the gate kicks in.
+
+**Relative L2 vs KL Divergence.** Both give usable Pareto curves. KL is more aggressive — it exits earlier at the same quality level, especially on sampled models. It also shows higher exit depth std (more spread across tokens). Relative L2 is more conservative and tracks convergence more tightly. Either works; KL saves more FLOPs, L2 is safer and does not require token prediction.
+
+**Acceleration gate is useless.** Across all models, acceleration never fires at any threshold below 1.0 — mean exit depth stays at maximum. At threshold=1.0 it collapses to depth ~4 with nothing in between. The two-hit second-order condition is just too conservative: the state changes are smooth enough that the second derivative never crosses typical thresholds. No Pareto curve, no practical use.
+
+### Interpretation
+
+The depth histograms show multimodal exit distributions — tokens do exit at different depths, especially at r=12 where the gate has room to spread. Whether this reflects meaningful per-token adaptation or just noise in convergence speed is hard to tell from BPB alone, since the overall loss barely changes across operating points. The gate does "something" per-token, but we can't say yet whether the tokens that get more compute actually needed it.
+
+The practical value is inference efficiency: sampled models can run at their training depth (or higher) and gate away iterations that don't contribute to the loss. Whether the per-token depth variation is "adaptive compute" in a useful sense — harder tokens thinking longer — or just an artifact of convergence dynamics remains open.
+
+### Next Steps
+
+- **Learned gating.** A linear probe on recurrent state (or state differences) could adapt per-token rather than using a fixed global threshold. Compare fully post-hoc and integrated into pre-training. Use r6_sample as the base model — it has the most headroom for early exit and showed the smoothest gating behavior here.
+
 ---
 
 ## 2026-02-13: Sampled Depth Sweep at Scale
