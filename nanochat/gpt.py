@@ -34,6 +34,7 @@ from nanochat.common import get_dist_info, print0
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
+from nanochat.gates import GateChecker, GateConfig, GateStats
 from nanochat.optim import DistMuonAdamW, MuonAdamW
 
 
@@ -752,3 +753,132 @@ class GPT(nn.Module):
             return logits, s, intermediate_logits
         else:
             return logits, s
+
+    def forward_gated(
+        self,
+        idx: torch.Tensor,
+        gate_config: GateConfig,
+        num_recur: int | None = None,
+        kv_cache=None,
+        warm_start_state: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, GateStats]:
+        """
+        Forward pass with early-exit gating.
+
+        Like forward(), but each (B, T) position can exit the recurrence loop
+        independently when the gate condition fires. Exited positions have their
+        state frozen; the loop breaks early when all positions have exited.
+
+        Only kv_budget=1 is supported. KV cache entries for exited tokens are
+        preserved from their exit iteration (not overwritten by later iterations).
+
+        Args:
+            idx: input token ids, shape (B, T)
+            gate_config: GateConfig specifying gate type, threshold, etc.
+            num_recur: max recurrence depth (default: train_recur_mean)
+            kv_cache: optional KVCache (must have kv_budget=1 if provided)
+            warm_start_state: optional (B, 1, D) state from previous token
+
+        Returns:
+            logits: (B, T, vocab_size) in float32
+            s: (B, T, n_embd) final gated recurrent state
+            stats: GateStats with per-position exit depths
+        """
+        B, T = idx.size()
+        if num_recur is None:
+            num_recur = int(self.config.train_recur_mean)
+
+        kv_budget = kv_cache.kv_budget if kv_cache is not None else None
+        if kv_budget is not None:
+            assert kv_budget == 1, "forward_gated only supports kv_budget=1"
+
+        # Rotary embeddings (same logic as forward)
+        assert self.cos.size(1) >= T
+        if kv_cache is not None and T == 1 and not torch.all(kv_cache.cache_seqlens == kv_cache.cache_seqlens[0]):
+            positions = kv_cache.cache_seqlens.long()
+            cos_sin = (self.cos[0, positions].unsqueeze(1), self.sin[0, positions].unsqueeze(1))
+        else:
+            T0 = 0 if kv_cache is None else kv_cache.get_pos()
+            cos_sin = (self.cos[:, T0:T0 + T], self.sin[:, T0:T0 + T])
+
+        # 1. Embedding + prelude (identical to forward)
+        x = self.transformer.wte(idx)
+        x = self.norm_emb(x)
+        for i, block in enumerate(self.transformer.prelude):
+            layer_idx = self._get_kv_layer_idx("prelude", i, kv_budget)
+            x = block(x, cos_sin, self.window_sizes[i], kv_cache, layer_idx)
+        e = x
+
+        # 2. Gated recurrence
+        gate = GateChecker(gate_config, B, T, device=e.device)
+        needs_logits = gate_config.gate_type == "kl_divergence"
+        s = None
+
+        # KV cache save buffers: preserve recur KV entries for exited tokens
+        kv_save_k: list[torch.Tensor] | None = None
+        kv_save_v: list[torch.Tensor] | None = None
+        recur_layer_indices: list[int] | None = None
+        if kv_cache is not None:
+            recur_layer_indices = [
+                self._get_kv_layer_idx("recur", j, 1, recur_iter=0)
+                for j in range(self.config.n_recur_block)
+            ]
+            T_start = kv_cache.get_pos()
+            # Allocate empty buffers — filled incrementally as tokens exit
+            sample_k, _ = kv_cache.get_layer_cache(recur_layer_indices[0])
+            kv_save_k = [torch.empty(B, T, sample_k.shape[-2], sample_k.shape[-1],
+                                     device=e.device, dtype=sample_k.dtype)
+                         for _ in recur_layer_indices]
+            kv_save_v = [torch.empty_like(kv_save_k[0]) for _ in recur_layer_indices]
+
+        for i in range(num_recur):
+            u = self._state_transfer(e, s=s, warm_start_state=warm_start_state)
+            for j, block in enumerate(self.transformer.recur):
+                layer_idx = self._get_kv_layer_idx("recur", j, 1, recur_iter=i)
+                u = block(u, cos_sin, self.window_sizes[self.config.n_prelude + j], kv_cache, layer_idx)
+            s_new = self.norm_recur(u)
+
+            # Freeze state for already-exited tokens
+            if s is not None and gate.exited.any():
+                s_new = torch.where(gate.exited.unsqueeze(-1), s, s_new)
+
+            # Gate check
+            logits_i = None
+            if needs_logits:
+                logits_i = self._predict(s_new, cos_sin, kv_cache, kv_budget)
+            newly_exited = gate.step(i, s_new, logits=logits_i)
+
+            # Save recur KV entries for newly exited tokens
+            if kv_cache is not None and newly_exited.any():
+                for j_layer, li in enumerate(recur_layer_indices):
+                    k_layer, v_layer = kv_cache.get_layer_cache(li)
+                    # k_layer is (B, max_seq, H, D); we care about positions T_start:T_start+T
+                    k_slice = k_layer[:, T_start:T_start + T]  # (B, T, H, D) view
+                    v_slice = v_layer[:, T_start:T_start + T]
+                    # Copy entries for newly exited positions
+                    ne = newly_exited.unsqueeze(-1).unsqueeze(-1)  # (B, T, 1, 1)
+                    kv_save_k[j_layer] = torch.where(ne, k_slice, kv_save_k[j_layer])
+                    kv_save_v[j_layer] = torch.where(ne, v_slice, kv_save_v[j_layer])
+
+            s = s_new
+            if gate.exited.all():
+                break
+
+        # Restore saved KV entries for all tokens that exited early
+        if kv_cache is not None and gate.exited.any():
+            ex = gate.exited.unsqueeze(-1).unsqueeze(-1)  # (B, T, 1, 1)
+            for j_layer, li in enumerate(recur_layer_indices):
+                k_layer, v_layer = kv_cache.get_layer_cache(li)
+                k_slice = k_layer[:, T_start:T_start + T]
+                v_slice = v_layer[:, T_start:T_start + T]
+                k_slice.copy_(torch.where(ex, kv_save_k[j_layer], k_slice))
+                v_slice.copy_(torch.where(ex, kv_save_v[j_layer], v_slice))
+
+        # 3. Final prediction (also writes correct coda KV)
+        logits = self._predict(s, cos_sin, kv_cache, kv_budget)
+
+        if kv_cache is not None:
+            kv_cache.advance(T)
+
+        stats = gate.finalize(num_recur)
+        return logits, s, stats
