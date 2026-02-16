@@ -160,7 +160,7 @@ def evaluate_with_gates(
 
     Returns a dict with:
         - gate_results: {gate_name: {threshold: {"correct": int, "total": int, "total_depth": int}}}
-        - max_r_correct, r1_correct, train_r_correct, total, num_recur, train_recur
+        - max_r_correct, train_r_correct, total, num_recur, train_recur
     """
     device = model.get_device()
     bos = tokenizer.get_bos_token_id()
@@ -176,10 +176,9 @@ def evaluate_with_gates(
     for gate_name, thresholds in GATES:
         gate_results[gate_name] = {}
         for thr in thresholds:
-            gate_results[gate_name][thr] = {"correct": 0, "total": 0, "total_depth": 0}
+            gate_results[gate_name][thr] = {"correct": 0, "total": 0, "total_depth": 0, "total_depth_sq": 0.0}
 
     max_r_correct = 0
-    r1_correct = 0
     train_r_correct = 0
     total = 0
     letter_to_id_cache = {}
@@ -236,10 +235,6 @@ def evaluate_with_gates(
             focus_logits = logits_full[idx, answer_pos, letter_ids]
             max_r_correct += int(focus_logits.argmax(dim=-1).item() == correct_idx_in_letters)
 
-            # r=1 baseline
-            r1_focus = intermediate_logits[0][idx, answer_pos, letter_ids]
-            r1_correct += int(r1_focus.argmax(dim=-1).item() == correct_idx_in_letters)
-
             # train_r baseline
             train_r_focus = intermediate_logits[train_recur - 1][idx, answer_pos, letter_ids]
             train_r_correct += int(train_r_focus.argmax(dim=-1).item() == correct_idx_in_letters)
@@ -255,6 +250,7 @@ def evaluate_with_gates(
                     gate_results[gate_name][thr]["correct"] += int(is_correct)
                     gate_results[gate_name][thr]["total"] += 1
                     gate_results[gate_name][thr]["total_depth"] += token_exit
+                    gate_results[gate_name][thr]["total_depth_sq"] += token_exit ** 2
 
             total += 1
 
@@ -270,30 +266,30 @@ def evaluate_with_gates(
     # Reduce across ranks if distributed
     if world_size > 1:
         counters = torch.tensor(
-            [max_r_correct, r1_correct, train_r_correct, total],
+            [max_r_correct, train_r_correct, total],
             dtype=torch.long, device=device,
         )
         dist.all_reduce(counters, op=dist.ReduceOp.SUM)
-        max_r_correct, r1_correct, train_r_correct, total = counters.tolist()
+        max_r_correct, train_r_correct, total = counters.tolist()
 
         for gate_name, thresholds_dict in gate_results.items():
             gate_counters = []
             gate_keys = sorted(thresholds_dict.keys())
             for thr in gate_keys:
                 s = thresholds_dict[thr]
-                gate_counters.extend([s["correct"], s["total"], s["total_depth"]])
-            gate_tensor = torch.tensor(gate_counters, dtype=torch.long, device=device)
+                gate_counters.extend([s["correct"], s["total"], s["total_depth"], s["total_depth_sq"]])
+            gate_tensor = torch.tensor(gate_counters, dtype=torch.float64, device=device)
             dist.all_reduce(gate_tensor, op=dist.ReduceOp.SUM)
             gate_list = gate_tensor.tolist()
             for i, thr in enumerate(gate_keys):
-                thresholds_dict[thr]["correct"] = gate_list[i * 3]
-                thresholds_dict[thr]["total"] = gate_list[i * 3 + 1]
-                thresholds_dict[thr]["total_depth"] = gate_list[i * 3 + 2]
+                thresholds_dict[thr]["correct"] = int(gate_list[i * 4])
+                thresholds_dict[thr]["total"] = int(gate_list[i * 4 + 1])
+                thresholds_dict[thr]["total_depth"] = gate_list[i * 4 + 2]
+                thresholds_dict[thr]["total_depth_sq"] = gate_list[i * 4 + 3]
 
     return {
         "gate_results": gate_results,
         "max_r_correct": max_r_correct,
-        "r1_correct": r1_correct,
         "train_r_correct": train_r_correct,
         "total": total,
         "num_recur": num_recur,
@@ -337,7 +333,7 @@ def evaluate_bpb_with_gates(
     Compute BPB on validation data for baseline recursion depths and each gate/threshold.
 
     Evaluates `val_tokens` total tokens (rounded down to full batches). For each batch:
-      - 3 baseline forwards (max_r, train_r, r=1) via model(x, y)
+      - 2 baseline forwards (max_r, train_r) via model(x, y)
       - 1 gated forward per gate/threshold via model.forward_gated
 
     Args:
@@ -346,7 +342,7 @@ def evaluate_bpb_with_gates(
 
     Returns dict with:
         - gate_results: {gate_name: {thr: {"total_nats", "total_bytes", "total_depth", "total_tokens"}}}
-        - max_r_bpb, train_r_bpb, r1_bpb, num_recur, train_recur
+        - max_r_bpb, train_r_bpb, num_recur, train_recur
     """
     train_recur = int(model.config.train_recur_mean)
     sequence_len = model.config.sequence_len
@@ -362,7 +358,6 @@ def evaluate_bpb_with_gates(
     baselines = {
         "max_r": {"nats": 0.0, "bytes": 0},
         "train_r": {"nats": 0.0, "bytes": 0},
-        "r1": {"nats": 0.0, "bytes": 0},
     }
     # Gate accumulators
     gate_results: dict[str, dict[float, dict]] = {}
@@ -394,11 +389,6 @@ def evaluate_bpb_with_gates(
         nats, nbytes = _accumulate_bpb(loss_train_r, y, token_bytes)
         baselines["train_r"]["nats"] += nats.item()
         baselines["train_r"]["bytes"] += nbytes.item()
-
-        loss_r1 = model(x, y, loss_reduction="none", num_recur=1)
-        nats, nbytes = _accumulate_bpb(loss_r1, y, token_bytes)
-        baselines["r1"]["nats"] += nats.item()
-        baselines["r1"]["bytes"] += nbytes.item()
 
         # Gated forwards
         for gate_name, thresholds in GATES:
@@ -439,12 +429,12 @@ def evaluate_bpb_with_gates(
         device_t = model.get_device()
         # Baselines
         bl_tensor = torch.tensor(
-            [baselines[k][m] for k in ["max_r", "train_r", "r1"] for m in ["nats", "bytes"]],
+            [baselines[k][m] for k in ["max_r", "train_r"] for m in ["nats", "bytes"]],
             dtype=torch.float64, device=device_t,
         )
         dist.all_reduce(bl_tensor, op=dist.ReduceOp.SUM)
         bl_list = bl_tensor.tolist()
-        for i, k in enumerate(["max_r", "train_r", "r1"]):
+        for i, k in enumerate(["max_r", "train_r"]):
             baselines[k]["nats"] = bl_list[i * 2]
             baselines[k]["bytes"] = int(bl_list[i * 2 + 1])
 
@@ -476,7 +466,6 @@ def evaluate_bpb_with_gates(
         "gate_results": gate_results,
         "max_r_bpb": _bpb_from_nats_bytes(baselines["max_r"]["nats"], baselines["max_r"]["bytes"]),
         "train_r_bpb": _bpb_from_nats_bytes(baselines["train_r"]["nats"], baselines["train_r"]["bytes"]),
-        "r1_bpb": _bpb_from_nats_bytes(baselines["r1"]["nats"], baselines["r1"]["bytes"]),
         "num_recur": num_recur,
         "train_recur": train_recur,
     }
@@ -536,33 +525,45 @@ def plot_pareto_curves(
         train_recur = result["eval_result"]["train_recur"]
         total = result["eval_result"]["total"]
         max_r_acc = result["eval_result"]["max_r_correct"] / total
-        r1_acc = result["eval_result"]["r1_correct"] / total
         train_r_acc = result["eval_result"]["train_r_correct"] / total
 
         # Baselines (FLOPs normalized to train_r=1.0)
-        r1_flops = compute_flops_fraction(params, 1, train_recur)
         max_r_flops = compute_flops_fraction(params, num_recur, train_recur)
         ax.axhline(y=max_r_acc, color="black", linestyle="--", alpha=0.5, label=f"max_r={num_recur} ({max_r_acc:.3f})")
         ax.axvline(x=max_r_flops, color="black", linestyle="--", alpha=0.3)
         ax.axhline(y=train_r_acc, color="#CC79A7", linestyle="-.", alpha=0.5, label=f"train_r={train_recur} ({train_r_acc:.3f})")
         ax.axvline(x=1.0, color="#CC79A7", linestyle="-.", alpha=0.3)
-        ax.axhline(y=r1_acc, color="gray", linestyle=":", alpha=0.5, label=f"r=1 ({r1_acc:.3f})")
-        ax.axvline(x=r1_flops, color="gray", linestyle=":", alpha=0.3)
+
+        # Compute FLOPs-per-depth for converting depth std to FLOPs std
+        recur_flops = params["recur_block"] + params["inject"]
+        fixed_flops = params["prelude"] + params["coda"] + params["wte"] + params["lm_head"] + params["scalars"]
+        train_cost = fixed_flops + train_recur * recur_flops
+        flops_per_depth = recur_flops / train_cost
 
         # Gate curves
         for gate_name, thresholds_dict in result["eval_result"]["gate_results"].items():
             flops_list = []
             acc_list = []
+            flops_err = []
             for thr, stats in sorted(thresholds_dict.items()):
                 if stats["total"] == 0:
                     continue
                 acc = stats["correct"] / stats["total"]
                 mean_depth = stats["total_depth"] / stats["total"]
+                var_depth = stats["total_depth_sq"] / stats["total"] - mean_depth ** 2
+                std_depth = max(var_depth, 0.0) ** 0.5
                 flops_frac = compute_flops_fraction(params, mean_depth, train_recur)
                 flops_list.append(flops_frac)
                 acc_list.append(acc)
+                flops_err.append(std_depth * flops_per_depth)
 
             if flops_list:
+                flops_lo = [f - e for f, e in zip(flops_list, flops_err)]
+                flops_hi = [f + e for f, e in zip(flops_list, flops_err)]
+                ax.fill_betweenx(
+                    acc_list, flops_lo, flops_hi,
+                    color=gate_colors[gate_name], alpha=0.15,
+                )
                 ax.plot(
                     flops_list, acc_list,
                     color=gate_colors[gate_name],
@@ -614,7 +615,7 @@ def save_results_csv(
     csv_path = output_dir / f"gating_results_{task_name.lower().replace('-', '_')}{suffix}.csv"
     header = [
         "model_tag", "task", "gate", "threshold",
-        "accuracy", "mean_exit_depth", "flops_fraction",
+        "accuracy", "mean_exit_depth", "std_exit_depth", "flops_fraction",
         "correct", "total",
     ]
     # Key: (model_tag, task, gate, threshold)
@@ -636,14 +637,10 @@ def save_results_csv(
             rows = []
             max_r_acc = result["eval_result"]["max_r_correct"] / total
             max_r_flops = compute_flops_fraction(params, num_recur, train_recur)
-            rows.append([model_tag, task_name, "max_r", num_recur, f"{max_r_acc:.6f}", num_recur, f"{max_r_flops:.6f}", result["eval_result"]["max_r_correct"], total])
+            rows.append([model_tag, task_name, "max_r", num_recur, f"{max_r_acc:.6f}", num_recur, "0.00", f"{max_r_flops:.6f}", result["eval_result"]["max_r_correct"], total])
 
             train_r_acc = result["eval_result"]["train_r_correct"] / total
-            rows.append([model_tag, task_name, "train_r", train_recur, f"{train_r_acc:.6f}", train_recur, "1.000000", result["eval_result"]["train_r_correct"], total])
-
-            r1_acc = result["eval_result"]["r1_correct"] / total
-            r1_flops = compute_flops_fraction(params, 1, train_recur)
-            rows.append([model_tag, task_name, "r1", 1, f"{r1_acc:.6f}", 1, f"{r1_flops:.6f}", result["eval_result"]["r1_correct"], total])
+            rows.append([model_tag, task_name, "train_r", train_recur, f"{train_r_acc:.6f}", train_recur, "0.00", "1.000000", result["eval_result"]["train_r_correct"], total])
 
             for gate_name, thresholds_dict in result["eval_result"]["gate_results"].items():
                 for thr, stats in sorted(thresholds_dict.items()):
@@ -651,8 +648,10 @@ def save_results_csv(
                         continue
                     acc = stats["correct"] / stats["total"]
                     mean_depth = stats["total_depth"] / stats["total"]
+                    var_depth = stats["total_depth_sq"] / stats["total"] - mean_depth ** 2
+                    std_depth = max(var_depth, 0.0) ** 0.5
                     flops_frac = compute_flops_fraction(params, mean_depth, train_recur)
-                    rows.append([model_tag, task_name, gate_name, thr, f"{acc:.6f}", f"{mean_depth:.2f}", f"{flops_frac:.6f}", stats["correct"], stats["total"]])
+                    rows.append([model_tag, task_name, gate_name, thr, f"{acc:.6f}", f"{mean_depth:.2f}", f"{std_depth:.2f}", f"{flops_frac:.6f}", stats["correct"], stats["total"]])
 
             for row in rows:
                 key = tuple(str(row[i]) for i in [0, 1, 2, 3])
@@ -701,32 +700,44 @@ def plot_pareto_bpb(
 
         max_r_bpb = bpb_result["max_r_bpb"]
         train_r_bpb = bpb_result["train_r_bpb"]
-        r1_bpb = bpb_result["r1_bpb"]
 
         # Baselines (FLOPs normalized to train_r=1.0)
-        r1_flops = compute_flops_fraction(params, 1, train_recur)
         max_r_flops = compute_flops_fraction(params, num_recur, train_recur)
         ax.axhline(y=max_r_bpb, color="black", linestyle="--", alpha=0.5, label=f"max_r={num_recur} ({max_r_bpb:.4f})")
         ax.axvline(x=max_r_flops, color="black", linestyle="--", alpha=0.3)
         ax.axhline(y=train_r_bpb, color="#CC79A7", linestyle="-.", alpha=0.5, label=f"train_r={train_recur} ({train_r_bpb:.4f})")
         ax.axvline(x=1.0, color="#CC79A7", linestyle="-.", alpha=0.3)
-        ax.axhline(y=r1_bpb, color="gray", linestyle=":", alpha=0.5, label=f"r=1 ({r1_bpb:.4f})")
-        ax.axvline(x=r1_flops, color="gray", linestyle=":", alpha=0.3)
+
+        # Compute FLOPs-per-depth for converting depth std to FLOPs std
+        recur_flops = params["recur_block"] + params["inject"]
+        fixed_flops = params["prelude"] + params["coda"] + params["wte"] + params["lm_head"] + params["scalars"]
+        train_cost = fixed_flops + train_recur * recur_flops
+        flops_per_depth = recur_flops / train_cost  # d(flops_frac)/d(depth)
 
         # Gate curves
         for gate_name, thresholds_dict in bpb_result["gate_results"].items():
             flops_list = []
             bpb_list = []
+            flops_err = []
             for thr, stats in sorted(thresholds_dict.items()):
                 if stats["total_tokens"] == 0:
                     continue
                 bpb = _bpb_from_nats_bytes(stats["total_nats"], stats["total_bytes"])
                 mean_depth = stats["total_depth"] / stats["total_tokens"]
+                var_depth = stats["total_depth_sq"] / stats["total_tokens"] - mean_depth ** 2
+                std_depth = max(var_depth, 0.0) ** 0.5
                 flops_frac = compute_flops_fraction(params, mean_depth, train_recur)
                 flops_list.append(flops_frac)
                 bpb_list.append(bpb)
+                flops_err.append(std_depth * flops_per_depth)
 
             if flops_list:
+                flops_lo = [f - e for f, e in zip(flops_list, flops_err)]
+                flops_hi = [f + e for f, e in zip(flops_list, flops_err)]
+                ax.fill_betweenx(
+                    bpb_list, flops_lo, flops_hi,
+                    color=gate_colors[gate_name], alpha=0.15,
+                )
                 ax.plot(
                     flops_list, bpb_list,
                     color=gate_colors[gate_name],
@@ -853,8 +864,6 @@ def save_bpb_csv(
             max_r_flops = compute_flops_fraction(params, num_recur, train_recur)
             rows.append([model_tag, "max_r", num_recur, f"{bpb_result['max_r_bpb']:.6f}", num_recur, "0.00", f"{max_r_flops:.6f}"])
             rows.append([model_tag, "train_r", train_recur, f"{bpb_result['train_r_bpb']:.6f}", train_recur, "0.00", "1.000000"])
-            r1_flops = compute_flops_fraction(params, 1, train_recur)
-            rows.append([model_tag, "r1", 1, f"{bpb_result['r1_bpb']:.6f}", 1, "0.00", f"{r1_flops:.6f}"])
 
             # Gate results
             for gate_name, thresholds_dict in bpb_result["gate_results"].items():
@@ -911,7 +920,7 @@ def main():
         assert tn in TASK_MODULES, f"Unknown task: {tn}. Available: {list(TASK_MODULES.keys())}"
 
     # Output directory
-    output_dir = Path(get_base_dir()) / "plots"
+    output_dir = Path(get_base_dir()) / "gating"
     output_dir.mkdir(exist_ok=True)
 
     # Process models sequentially to avoid holding all in GPU memory
@@ -956,7 +965,6 @@ def main():
             print0(f"Results for {tag_label}:")
             print0(f"  max_r bpb:   {bpb_result['max_r_bpb']:.4f}")
             print0(f"  train_r bpb: {bpb_result['train_r_bpb']:.4f} [train_r={bpb_result['train_recur']}]")
-            print0(f"  r=1 bpb:     {bpb_result['r1_bpb']:.4f}")
 
             all_bpb_results[tag_label] = {
                 "bpb_result": bpb_result,
@@ -994,7 +1002,6 @@ def main():
             print0(f"Results for {tag_label}:")
             print0(f"  max_r accuracy:   {eval_result['max_r_correct']}/{total} ({100 * eval_result['max_r_correct'] / total:.2f}%)")
             print0(f"  train_r accuracy: {eval_result['train_r_correct']}/{total} ({100 * eval_result['train_r_correct'] / total:.2f}%) [train_r={eval_result['train_recur']}]")
-            print0(f"  r=1 accuracy:     {eval_result['r1_correct']}/{total} ({100 * eval_result['r1_correct'] / total:.2f}%)")
 
             all_task_results[task_name][tag_label] = {
                 "eval_result": eval_result,
@@ -1009,8 +1016,10 @@ def main():
                         continue
                     acc = stats["correct"] / stats["total"]
                     mean_depth = stats["total_depth"] / stats["total"]
+                    var_depth = stats["total_depth_sq"] / stats["total"] - mean_depth ** 2
+                    std_depth = max(var_depth, 0.0) ** 0.5
                     flops_frac = compute_flops_fraction(scaling_params, mean_depth, gate_train_recur)
-                    print0(f"    thr={thr:<8} acc={acc:.4f}  mean_depth={mean_depth:.2f}  flops={flops_frac:.4f}")
+                    print0(f"    thr={thr:<8} acc={acc:.4f}  mean_depth={mean_depth:.2f}  std={std_depth:.2f}  flops={flops_frac:.4f}")
 
         del model
         print0(f"  Freed model: {tag_label}")
