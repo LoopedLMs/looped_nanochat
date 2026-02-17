@@ -8,10 +8,11 @@ Running log of experiments on the looped (depth-recurrent) transformer, forked f
 
 -> See branch "gating" for implementation
 
-Tested zero-shot early-exit gating on the four S20 SFT models from 2026-02-13 (r4_fixed, r4_sample, r6_fixed, r6_sample). Three training-free gates evaluated: 
+Tested zero-shot early-exit gating on the four S20 SFT models from 2026-02-13 (r4_fixed, r4_sample, r6_fixed, r6_sample). Four training-free gates evaluated:
 1. **Relative L2** - normalized state change between consecutive loops
 2. **KL Divergence** - output distribution shift
-3. **Acceleration** - Pappone et al., 2025; normalized second-order convergence with a two-hit confirmation rule. 
+3. **Acceleration** - Pappone et al., 2025; normalized second-order convergence with a two-hit confirmation rule
+4. **Entropy** - Shannon entropy of output distribution (LoopViT, arXiv:2602.02156); exit when H < τ
 
 Each gate monitors per-token convergence and exits early when the signal drops below a threshold. Minimum exit depth is 3 (need at least two state differences for all gates). Evaluated on val BPB (at native depth and extrapolated to r=12).
 
@@ -25,7 +26,9 @@ Each gate monitors per-token convergence and exits early when the signal drops b
 
 **Relative L2 vs KL Divergence.** Both give usable Pareto curves. KL is more aggressive — it exits earlier at the same quality level, especially on sampled models. It also shows higher exit depth std (more spread across tokens). Relative L2 is more conservative and tracks convergence more tightly. Either works; KL saves more FLOPs, L2 is safer and does not require token prediction.
 
-**Acceleration gate is useless.** Across all models, acceleration never fires at any threshold below 1.0 — mean exit depth stays at maximum. At threshold=1.0 it collapses to depth ~4 with nothing in between. The two-hit second-order condition is just too conservative: the state changes are smooth enough that the second derivative never crosses typical thresholds. No Pareto curve, no practical use.
+**Acceleration gate doesn't work.** Across all models, acceleration never exits between min and max depth. It doesn't work for our setup.
+
+**Entropy gate (LoopViT-style) doesn't work, but reveals something interesting.** Inspired by LoopViT (arXiv:2602.02156), tested a Shannon entropy gate: exit when per-token output entropy H < τ. Swept τ ∈ {0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 3.0}. The depth histograms are bimodal — tokens either exit below training depth (already confident) or run to max depth 12 (never confident enough). The interesting finding: **entropy does not meaningfully decrease above the training depth**, even though the KL divergence between consecutive states does. The model keeps *changing* its representations at higher depths (KL detects this), but the overall confidence of the output distribution stays flat. This means the extra iterations redistribute probability mass without concentrating it — the model "explores" rather than "converges" beyond its training depth. This makes entropy unsuitable as a stopping criterion for extrapolation (it can only catch tokens that were already easy), while convergence-based gates (relative L2, KL) work because they detect *stabilization* regardless of absolute confidence.
 
 ### Interpretation
 
