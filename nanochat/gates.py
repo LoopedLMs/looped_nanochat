@@ -9,6 +9,7 @@ Gate types:
     1. acceleration: second-order convergence (Pappone et al.), two-hit
     2. relative_l2: relative state change magnitude
     3. kl_divergence: KL between consecutive logit distributions
+    4. entropy: Shannon entropy of output distribution (LoopViT-style crystallization)
 
   Learned:
     4. LearnedGate: linear probe on recurrent state, trained with soft mixture loss
@@ -26,7 +27,7 @@ import torch.nn.functional as F
 class GateConfig:
     """Configuration for early-exit gating."""
 
-    gate_type: Literal["acceleration", "relative_l2", "kl_divergence"]
+    gate_type: Literal["acceleration", "relative_l2", "kl_divergence", "entropy"]
     threshold: float
     normalized: bool = True  # acceleration gate only
 
@@ -95,6 +96,9 @@ class GateChecker:
             fires = self._check_acceleration(state)
         elif self.config.gate_type == "relative_l2":
             fires = self._check_relative_l2(state)
+        elif self.config.gate_type == "entropy":
+            assert logits is not None, "entropy gate requires logits"
+            fires = self._check_entropy(logits)
         else:
             assert logits is not None, "kl_divergence gate requires logits"
             fires = self._check_kl(logits)
@@ -165,6 +169,13 @@ class GateChecker:
         ).sum(dim=-1)
         self._prev_log_probs = log_probs
         return kl < self.threshold
+
+    def _check_entropy(self, logits: torch.Tensor) -> torch.Tensor:
+        """Shannon entropy of output distribution: H = -sum p log p. Fires when H < threshold."""
+        log_probs = F.log_softmax(logits, dim=-1)
+        probs = log_probs.exp()
+        entropy = -(probs * log_probs).sum(dim=-1)  # (B, T)
+        return entropy < self.threshold
 
     # ------------------------------------------------------------------
 

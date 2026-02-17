@@ -811,7 +811,7 @@ class GPT(nn.Module):
 
         # 2. Gated recurrence
         gate = GateChecker(gate_config, B, T, device=e.device)
-        needs_logits = gate_config.gate_type == "kl_divergence"
+        needs_logits = gate_config.gate_type in ("kl_divergence", "entropy")
         s = None
 
         # KV cache save buffers: preserve recur KV entries for exited tokens

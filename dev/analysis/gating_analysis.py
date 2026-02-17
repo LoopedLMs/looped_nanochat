@@ -13,6 +13,7 @@ Gate functions (all zero-shot, no trained params, defined in nanochat/gates.py):
   1. Acceleration (Pappone et al.): normalized second-order convergence, two-hit
   2. Relative L2: ||s_i - s_{i-1}|| / ||s_i||
   3. KL divergence on intermediate logits
+  4. Entropy: Shannon entropy of output distribution (LoopViT-style crystallization)
 
 Example:
     uv run python dev/analysis/gating_analysis.py -i sft --val-loss --val-tokens 3000000 -g d12
@@ -56,9 +57,10 @@ TASK_MODULES = {
 # Gate sweep configuration: (name, thresholds)
 
 GATES = [
-    #("acceleration", [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 1.0]),
+    ("acceleration", [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 1.0]),
     ("relative_l2", [0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5]),
     ("kl_divergence", [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 0.75]),
+    ("entropy", [0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 3.0]),
 ]
 
 # ---------------------------------------------------------------------------
@@ -511,11 +513,13 @@ def plot_pareto_curves(
         "acceleration": "#332288",
         "relative_l2": "#E69F00",
         "kl_divergence": "#009E73",
+        "entropy": "#0072B2",
     }
     gate_markers = {
         "acceleration": "o",
         "relative_l2": "s",
         "kl_divergence": "D",
+        "entropy": "^",
     }
 
     for col_idx, (model_tag, result) in enumerate(all_model_results.items()):
@@ -684,11 +688,13 @@ def plot_pareto_bpb(
         "acceleration": "#332288",
         "relative_l2": "#E69F00",
         "kl_divergence": "#009E73",
+        "entropy": "#0072B2",
     }
     gate_markers = {
         "acceleration": "o",
         "relative_l2": "s",
         "kl_divergence": "D",
+        "entropy": "^",
     }
 
     for col_idx, (model_tag, result) in enumerate(all_model_results.items()):
@@ -903,10 +909,21 @@ def main():
     parser.add_argument("-x", "--max-problems", type=int, default=None, help="Max problems to evaluate (categorical only)")
     parser.add_argument("-d", "--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])
     parser.add_argument("--device-type", type=str, default="", choices=["cuda", "cpu", "mps", ""])
+    parser.add_argument("--gates", type=str, default=None, help="Pipe-separated gate names to run (e.g., entropy|kl_divergence). Default: all.")
     args = parser.parse_args()
 
     if not args.val_loss and args.task_name is None:
         parser.error("Specify --val-loss and/or -a TASK_NAME")
+
+    # Filter GATES if --gates is specified
+    global GATES
+    if args.gates is not None:
+        allowed = set(args.gates.split("|"))
+        all_names = {name for name, _ in GATES}
+        unknown = allowed - all_names
+        if unknown:
+            parser.error(f"Unknown gate(s): {unknown}. Available: {all_names}")
+        GATES = [(name, thrs) for name, thrs in GATES if name in allowed]
 
     device_type = autodetect_device_type() if args.device_type == "" else args.device_type
     _ddp, _ddp_rank, _ddp_local_rank, _ddp_world_size, device = compute_init(device_type)
