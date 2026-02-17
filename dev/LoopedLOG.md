@@ -4,6 +4,22 @@ Running log of experiments on the looped (depth-recurrent) transformer, forked f
 
 **Goal:** Exploratory work on understanding looped LLM behavior from the ground up. Small model sizes, limited compute budget, single runs for quick iteration. The end goal is a model with true dynamic compute and meaningful depth scaling at reasonable cost.
 
+## 2026-02-17: Post-Hoc Learned Exit Gate — Negative Result
+
+-> See branch "gating" for implementation, logs in `logs/exit_gate_train/`
+
+Trained a linear probe exit gate on frozen r6_sample (S20, 328M params) with entropy regularization (inspired by Ouro). Gate predicts a categorical distribution over exit depths; loss = task_loss − β · entropy_reg. Swept β ∈ {0, 0.01, 0.03, 0.05, 0.1, 0.2, 0.3} and two input modes: raw hidden state vs concatenation of consecutive states (state_delta).
+
+**State_delta Pareto-dominates single state.** The concatenated input (state difference) consistently achieves better task-loss-vs-depth tradeoffs. Likely because the frozen model was never trained to encode exit-readiness in a single state — the convergence signal lives in the *change* between states, not in any one state.
+
+**No trained gate matches training-free gates.** Across all β values, the learned gate underperforms the simple threshold-based gates from 2026-02-15 (relative L2, KL divergence). The entropy regularization pushes the gate toward uniform depth distributions, but the model strongly prefers later exits — early loop iterations are almost never good exit points because the model was trained with fixed/sampled depth and learned to rely on later steps.
+
+**Without regularization (β=0), gate collapses to max depth.** Entropy drops to ~0, E[depth] → 5.92/6. The task loss alone never incentivizes early exit. With increasing β, expected depth decreases (5.9 → 3.75) but task loss degrades monotonically. Could try geometric or other non-uniform target distributions for the regularization, but this would be overfitting the gate schedule to a specific dataset and model — not a general solution.
+
+**Conclusion:** A naive post-hoc gate doesn't learn meaningful early exit on a model that wasn't trained for it. Effective learned gating requires either (a) joint optimization of gate + model during training, or (b) integrating the entropy/exit regularization directly into the training loss so the model learns to produce useful outputs at intermediate depths. We do not pursue post-hoc exit gating further.
+
+---
+
 ## 2026-02-15: Training-Free Early Exit — Sampled Models Exit Cleanly
 
 -> See branch "gating" for implementation
