@@ -1,5 +1,5 @@
 """
-Early-exit gate functions for looped transformer inference.
+Early-exit gate functions for looped transformer inference and training.
 
 Provides incremental gate checkers that evaluate exit conditions at each
 recurrence iteration, enabling actual early exit during the forward pass.
@@ -12,7 +12,9 @@ Gate types:
     4. entropy: Shannon entropy of output distribution (LoopViT-style crystallization)
 
   Learned:
-    4. LearnedGate: linear probe on recurrent state, trained with soft mixture loss
+    5. LearnedGate: linear probe on recurrent state, trained with soft mixture loss
+
+Joint gate training (Stage I) is integrated into GPT._forward_joint_gate().
 """
 
 from dataclasses import dataclass

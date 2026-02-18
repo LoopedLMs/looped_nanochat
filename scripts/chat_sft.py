@@ -19,6 +19,7 @@ from dataclasses import asdict
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 import wandb
 
 from nanochat.checkpoint_manager import load_model, save_checkpoint
@@ -86,6 +87,12 @@ parser.add_argument(
     default="basic",
     help="Gradient tracking level: none (disabled), basic (global norm), detailed (per-component norms)",
 )
+# Exit gate (joint training, Stage I)
+parser.add_argument("--gate-enabled", action="store_true", help="enable joint exit gate training (Stage I)")
+parser.add_argument("--gate-lr", type=float, default=1e-3, help="learning rate for gate parameters (Adam)")
+parser.add_argument("--gate-gamma", type=float, default=0.05, help="entropy regularization weight for gate")
+parser.add_argument("--gate-input", type=str, default="state", choices=["state", "state_delta"],
+                    help="gate input mode: 'state' = s_i only, 'state_delta' = [s_i, s_i - s_{i-1}]")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -110,6 +117,14 @@ if pretrain_batch_size is not None and args.device_batch_size > pretrain_batch_s
     print0(
         f"FOOTGUN WARNING: base model training used device_batch_size {pretrain_batch_size}, did you pass in a good --device-batch-size to this script?"
     )
+# Enable exit gate if requested (and not already enabled from checkpoint)
+gate_enabled = args.gate_enabled
+if gate_enabled and model.gate is None:
+    model.enable_gate(input_mode=args.gate_input)
+    print0(f"Exit gate enabled (input_mode={args.gate_input}, lr={args.gate_lr}, gamma={args.gate_gamma})")
+    print0(f"Gate params: {sum(p.numel() for p in model.gate.parameters()):,}")
+elif gate_enabled:
+    print0(f"Gate already enabled from checkpoint (params: {sum(p.numel() for p in model.gate.parameters()):,})")
 orig_model = model
 # Use dynamic=False when recur sampling is enabled (varying num_recur causes recompilation otherwise)
 model = torch.compile(model, dynamic=bool(args.recur_samples_per_step))
@@ -147,6 +162,7 @@ optimizer = model.setup_optimizer(
     embedding_lr=args.embedding_lr,
     matrix_lr=args.matrix_lr,
     weight_decay=args.weight_decay,
+    gate_lr=args.gate_lr if gate_enabled else 1e-3,
 )
 # Set the initial learning rate as a fraction of the base learning rate
 for group in optimizer.param_groups:
@@ -384,6 +400,7 @@ while True:
         device=device,
     )
 
+    gate_stats_accum = None  # accumulated gate stats for logging
     for _micro_step in range(grad_accum_steps):
         # Get num_recur for this micro-step
         num_recur = get_num_recur_for_microstep(
@@ -395,11 +412,18 @@ while True:
             recur_samples_per_step=args.recur_samples_per_step,
         )
 
-        with autocast_ctx:
-            loss = model(x, y, num_recur=num_recur)
-        train_loss = loss.detach()  # for logging
-        loss = loss / grad_accum_steps  # each .backward() is a grad sum => normalize loss here
-        loss.backward()
+        if gate_enabled:
+            with autocast_ctx:
+                loss, g_stats = model(x, y, num_recur=num_recur, gate_gamma=args.gate_gamma)
+            train_loss = loss.detach()
+            (loss / grad_accum_steps).backward()
+            gate_stats_accum = g_stats
+        else:
+            with autocast_ctx:
+                loss = model(x, y, num_recur=num_recur)
+            train_loss = loss.detach()  # for logging
+            loss = loss / grad_accum_steps  # each .backward() is a grad sum => normalize loss here
+            loss.backward()
         x, y = next(train_loader)  # prefetch the next batch while the GPU is busy with forward/backward
         progress = max(progress, approx_progress)  # only increase progress monotonically
 
@@ -450,8 +474,9 @@ while True:
         logged_num_recur_str = f"{sampled_num_recurs} (mean={logged_num_recur:.1f})"
     if step > 10:
         total_training_time += dt  # only count the time after the first 10 steps
+    gate_str = f" | gate E[d]={gate_stats_accum['gate/expected_depth']:.2f} H={gate_stats_accum['gate/entropy']:.3f}" if gate_stats_accum else ""
     print0(
-        f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {current_epoch} | num_recur: {logged_num_recur_str} | total time: {total_training_time / 60:.2f}m"
+        f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {current_epoch} | num_recur: {logged_num_recur_str} | total time: {total_training_time / 60:.2f}m{gate_str}"
     )
     if step % 10 == 0:
         wandb_run.log(
@@ -471,6 +496,7 @@ while True:
                 "lr/embed": effective_lr_embed,     # effective learning rate for embeddings
                 "lr/unembed": effective_lr_unembed, # effective learning rate for unembedding (lm_head)
                 **{f"model_health/{k}": v for k, v in model_health_stats.items()},  # Add model health stats
+                **(gate_stats_accum if gate_stats_accum else {}),  # Add gate stats if gate is enabled
             }
         )
 

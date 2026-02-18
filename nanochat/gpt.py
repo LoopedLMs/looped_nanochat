@@ -29,12 +29,13 @@ from typing import Literal
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from nanochat.common import get_dist_info, print0
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
-from nanochat.gates import GateChecker, GateConfig, GateStats
+from nanochat.gates import GateChecker, GateConfig, GateStats, LearnedGate, compute_depth_weights, exit_distribution_entropy
 from nanochat.optim import DistMuonAdamW, MuonAdamW
 
 
@@ -219,6 +220,9 @@ class GPT(nn.Module):
         self.norm_recur = RMSNorm(config.n_embd)  # at end of recurrent block (nc)
         self.norm_final = RMSNorm(config.n_embd)  # before lm_head
         self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
+        # Exit gate (None until enable_gate() is called)
+        self.gate: LearnedGate | None = None
+
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -282,6 +286,15 @@ class GPT(nn.Module):
         # Cast embeddings to bf16: optimizer can tolerate it and it saves memory
         if self.transformer.wte.weight.device.type == "cuda":
             self.transformer.wte.to(dtype=torch.bfloat16)
+
+    def enable_gate(self, input_mode: str = "state"):
+        """Create and attach a LearnedGate for joint exit gate training."""
+        self.gate = LearnedGate(self.config.n_embd, input_mode=input_mode)
+        # Initialize gate weights to zero so it starts as a no-op (p ≈ 0.5 everywhere)
+        with torch.no_grad():
+            self.gate.linear.weight.zero_()
+            self.gate.linear.bias.zero_()
+        return self.gate
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
@@ -469,7 +482,10 @@ class GPT(nn.Module):
             + sum(p.numel() for p in self.norm_final.parameters())
         )
 
-        total = wte + value_embeds + lm_head + prelude + recur_block + coda + inject + scalars
+        # Gate parameters (tiny, excluded from scaling analysis)
+        gate = sum(p.numel() for p in self.gate.parameters()) if self.gate is not None else 0
+
+        total = wte + value_embeds + lm_head + prelude + recur_block + coda + inject + scalars + gate
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
 
         return {
@@ -481,6 +497,7 @@ class GPT(nn.Module):
             'coda': coda,
             'inject': inject,
             'scalars': scalars,
+            'gate': gate,
             'total': total,
         }
 
@@ -560,9 +577,11 @@ class GPT(nn.Module):
         matrix_lr=0.02,
         weight_decay=0.0,
         adam_betas=(0.8, 0.95),
+        gate_lr: float = 1e-3,
     ):
         """
         Create combined MuonAdamW optimizer: Muon for 2D matrix params, AdamW for embeddings.
+        If self.gate is not None, includes gate parameters as a separate AdamW group.
         """
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
@@ -589,7 +608,14 @@ class GPT(nn.Module):
         ]
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(norm_params)
+
+        # Gate parameters (if online gate is enabled)
+        gate_params_list = list(self.gate.parameters()) if self.gate is not None else []
+
+        expected_count = len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(norm_params) + len(gate_params_list)
+        assert len(list(self.parameters())) == expected_count, (
+            f"Parameter count mismatch: {len(list(self.parameters()))} != {expected_count}"
+        )
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -615,6 +641,11 @@ class GPT(nn.Module):
                     beta2=0.95,
                     weight_decay=weight_decay,
                 )
+            )
+        # Gate group (AdamW, separate LR, no dmodel scaling since it's a tiny probe)
+        if gate_params_list:
+            param_groups.append(
+                dict(kind="adamw", params=gate_params_list, lr=gate_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0)
             )
 
         Factory = DistMuonAdamW if ddp else MuonAdamW
@@ -654,6 +685,99 @@ class GPT(nn.Module):
         logits = softcap * torch.tanh(logits / softcap)
         return logits
 
+    def _predict_ce(self, s, cos_sin, targets):
+        """Fused predict + per-token CE for memory-efficient gate training.
+
+        Returns (B, T) per-token loss instead of (B, T, V) logits, reducing
+        checkpoint storage from O(B*T*V) to O(B*T) per recurrence depth.
+        """
+        logits = self._predict(s, cos_sin)
+        return F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            targets.view(-1),
+            ignore_index=-1,
+            reduction="none",
+        ).view(s.size(0), s.size(1))
+
+    def _forward_joint_gate(
+        self,
+        e: torch.Tensor,
+        cos_sin: tuple,
+        targets: torch.Tensor,
+        num_recur: int,
+        gate_gamma: float,
+        warm_start_state: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict]:
+        """
+        Joint gate + model training forward pass (Stage I).
+
+        Computes recurrence, gate exit probabilities, and soft-mixture CE loss
+        in a single fused pass. Per-depth CE is computed via gradient-checkpointed
+        _predict_ce, storing only (B, T) loss per depth instead of (B, T, V) logits.
+
+        Returns:
+            (loss, stats) where loss has gradients for both model and gate params
+        """
+        gate = self.gate
+
+        s = None
+        s_prev_float = None
+        exit_probs = []
+        per_depth_ce = []
+
+        for i in range(num_recur):
+            u = self._state_transfer(e, s=s, warm_start_state=warm_start_state)
+            for j, block in enumerate(self.transformer.recur):
+                u = block(u, cos_sin, self.window_sizes[self.config.n_prelude + j], None, None)
+            s = self.norm_recur(u)
+
+            # Truncated BPTT
+            if self.config.bptt_k is not None and i < num_recur - self.config.bptt_k:
+                s = s.detach()
+
+            # Gate exit probability (float32 for numerical stability)
+            s_float = s.float()
+            exit_probs.append(gate(s_float, s_prev_float))
+            s_prev_float = s_float
+
+            # Per-depth CE via fused predict+CE (gradient checkpointed to avoid
+            # storing (B, T, V) logits — only the (B, T) CE output is kept)
+            per_depth_ce.append(
+                torch_checkpoint(self._predict_ce, s, cos_sin, targets, use_reentrant=False)
+            )
+
+        # Weighted loss from exit-at-depth distribution (discrete hazard model)
+        weights = compute_depth_weights(exit_probs)
+        valid_mask = targets != -1
+        num_valid = valid_mask.float().sum().clamp(min=1)
+
+        task_loss = torch.zeros(1, device=targets.device, dtype=torch.float32)
+        for i in range(num_recur):
+            task_loss = task_loss + (weights[i] * per_depth_ce[i]).sum() / num_valid
+
+        # Entropy regularization: maximize H(exit distribution) to prevent collapse
+        entropy = exit_distribution_entropy(weights)
+        entropy_mean = (entropy * valid_mask.float()).sum() / num_valid
+
+        loss = task_loss - gate_gamma * entropy_mean
+
+        # Stats for logging
+        with torch.no_grad():
+            expected_depth = sum((i + 1) * w.mean() for i, w in enumerate(weights))
+            expected_depth_sq = sum((i + 1) ** 2 * w.mean() for i, w in enumerate(weights))
+            var_depth = expected_depth_sq.item() - expected_depth.item() ** 2
+            depth_std = max(var_depth, 0.0) ** 0.5
+
+        stats = {
+            "gate/loss": loss.item(),
+            "gate/task_loss": task_loss.item(),
+            "gate/entropy": entropy_mean.item(),
+            "gate/expected_depth": expected_depth.item(),
+            "gate/depth_std": depth_std,
+        }
+
+        return loss, stats
+
     def forward(
         self,
         idx,
@@ -664,6 +788,7 @@ class GPT(nn.Module):
         warm_start_state=None,
         return_intermediate_logits: bool = False,
         return_intermediate_states: bool = False,
+        gate_gamma: float | None = None,
     ):
         B, T = idx.size()
         if num_recur is None:
@@ -701,6 +826,12 @@ class GPT(nn.Module):
             layer_idx = self._get_kv_layer_idx("prelude", i, kv_budget)
             x = block(x, cos_sin, self.window_sizes[i], kv_cache, layer_idx)
         e = x  # prelude output, used for injection into each recurrence
+
+        # Joint gate training (Stage I): integrated forward + loss
+        if gate_gamma is not None:
+            assert self.gate is not None, "gate_gamma requires enable_gate() first"
+            assert targets is not None, "gate_gamma requires targets"
+            return self._forward_joint_gate(e, cos_sin, targets, num_recur, gate_gamma, warm_start_state)
 
         # 3. Initialize state variable
         s = None

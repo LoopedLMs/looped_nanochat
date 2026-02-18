@@ -37,7 +37,7 @@ def _patch_missing_config_keys(model_config_kwargs):
         log0("Patching missing input_injection in model config to 'inject_init_prelude'")
 
     # Remove deprecated config keys
-    deprecated_keys = ["kv_cache_recur_budget", "inject_mode", "recur_warm_start"]
+    deprecated_keys = ["kv_cache_recur_budget", "inject_mode", "recur_warm_start", "use_exit_gate", "exit_beta", "exit_min_recur", "train_recur_min"]
     for key in deprecated_keys:
         if key in model_config_kwargs:
             model_config_kwargs.pop(key)
@@ -48,6 +48,11 @@ def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
     # No patches currently needed
     pass
+
+
+def _has_gate_keys(model_data: dict) -> bool:
+    """Check if model_data contains gate parameters."""
+    return any(k.startswith("gate.") for k in model_data)
 
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
@@ -108,6 +113,16 @@ def build_model(checkpoint_dir, step, device, phase):
     _patch_missing_keys(model_data, model_config)
     with torch.device("meta"):
         model = GPT(model_config)
+    # If checkpoint has gate keys, enable the gate before loading
+    if _has_gate_keys(model_data):
+        # Infer input_mode from key shapes: gate.linear.weight shape (1, d) vs (1, 2d)
+        gate_weight_key = "gate.linear.weight"
+        if gate_weight_key in model_data:
+            gate_input_dim = model_data[gate_weight_key].shape[-1]
+            input_mode = "state_delta" if gate_input_dim == 2 * model_config.n_embd else "state"
+        else:
+            input_mode = "state"
+        model.enable_gate(input_mode=input_mode)
     # Load the model state
     model.to_empty(device=device)
     model.init_weights()  # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init

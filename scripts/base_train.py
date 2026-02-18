@@ -132,6 +132,12 @@ parser.add_argument(
     default="basic",
     help="Gradient tracking level: none (disabled), basic (global norm), detailed (per-component norms)",
 )
+# Exit gate (joint training, Stage I)
+parser.add_argument("--gate-enabled", action="store_true", help="enable joint exit gate training (Stage I)")
+parser.add_argument("--gate-lr", type=float, default=1e-3, help="learning rate for gate parameters (Adam)")
+parser.add_argument("--gate-gamma", type=float, default=0.05, help="entropy regularization weight for gate")
+parser.add_argument("--gate-input", type=str, default="state", choices=["state", "state_delta"],
+                    help="gate input mode: 'state' = s_i only, 'state_delta' = [s_i, s_i - s_{i-1}]")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -222,6 +228,14 @@ with torch.device("meta"):
 model.to_empty(device=device)  # All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights()  # All tensors get initialized
 
+# Enable exit gate if requested (before loading checkpoint so state_dict keys match)
+gate_enabled = args.gate_enabled
+if gate_enabled:
+    model.enable_gate(input_mode=args.gate_input)
+    model.gate.to(device)
+    print0(f"Exit gate enabled (input_mode={args.gate_input}, lr={args.gate_lr}, gamma={args.gate_gamma})")
+    print0(f"Gate params: {sum(p.numel() for p in model.gate.parameters()):,}")
+
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"s{args.size}"  # e.g. s12
@@ -236,7 +250,13 @@ if resuming:
         load_optimizer=True,
         rank=ddp_rank,
     )
-    model.load_state_dict(model_data, strict=True, assign=True)
+    # Handle gate: if resuming with gate but old checkpoint has no gate keys, load non-strictly
+    from nanochat.checkpoint_manager import _has_gate_keys
+    if gate_enabled and not _has_gate_keys(model_data):
+        print0("Checkpoint has no gate keys, loading non-strictly (gate will be initialized fresh)")
+        model.load_state_dict(model_data, strict=False, assign=True)
+    else:
+        model.load_state_dict(model_data, strict=True, assign=True)
     del model_data  # free up this memory after the copy
 
 orig_model = (
@@ -365,6 +385,7 @@ optimizer = model.setup_optimizer(
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
     adam_betas=adam_betas,
+    gate_lr=args.gate_lr if gate_enabled else 1e-3,
 )
 
 if resuming:
@@ -551,6 +572,7 @@ while True:
         device=device,
     )
 
+    gate_stats_accum = None  # accumulated gate stats for logging
     for _micro_step in range(grad_accum_steps):
         # Get num_recur for this micro-step
         num_recur = get_num_recur_for_microstep(
@@ -561,11 +583,18 @@ while True:
             grad_accum_steps=grad_accum_steps,
             recur_samples_per_step=args.recur_samples_per_step,
         )
-        with autocast_ctx:
-            loss = model(x, y, num_recur=num_recur)
-        train_loss = loss.detach()  # for logging
-        loss = loss / grad_accum_steps  # each .backward() is a grad sum => normalize loss here
-        loss.backward()
+        if gate_enabled:
+            with autocast_ctx:
+                loss, g_stats = model(x, y, num_recur=num_recur, gate_gamma=args.gate_gamma)
+            train_loss = loss.detach()
+            (loss / grad_accum_steps).backward()
+            gate_stats_accum = g_stats
+        else:
+            with autocast_ctx:
+                loss = model(x, y, num_recur=num_recur)
+            train_loss = loss.detach()  # for logging
+            loss = loss / grad_accum_steps  # each .backward() is a grad sum => normalize loss here
+            loss.backward()
         x, y, dataloader_state_dict = next(train_loader)  # prefetch the next batch while the GPU is busy with forward/backward
 
     # Compute model health statistics: gradients and parameters (after all backward passes complete)
@@ -614,8 +643,9 @@ while True:
     else:
         eta_str = ""
     epoch = dataloader_state_dict["epoch"]
+    gate_str = f" | gate E[d]={gate_stats_accum['gate/expected_depth']:.2f} H={gate_stats_accum['gate/entropy']:.3f}" if gate_stats_accum else ""
     print0(
-        f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time / 60:.2f}m{eta_str}"
+        f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time / 60:.2f}m{eta_str}{gate_str}"
     )
     if step % 100 == 0:
         # For logging: report num_recur info
@@ -640,6 +670,7 @@ while True:
             "lr/unembed": effective_lr_unembed,     # effective learning rate for unembedding (lm_head)
             "muon/weight_decay": muon_weight_decay, # Muon weight decay schedule value
             **{f"model_health/{k}": v for k, v in model_health_stats.items()},  # Add model health stats
+            **(gate_stats_accum if gate_stats_accum else {}),  # Add gate stats if gate is enabled
         }
         wandb_run.log(log_data)
 
