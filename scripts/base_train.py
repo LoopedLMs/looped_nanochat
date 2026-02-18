@@ -242,7 +242,13 @@ if resuming:
 orig_model = (
     model  # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
 )
-model = torch.compile(model, dynamic=bool(args.recur_samples_per_step))
+if args.recur_samples_per_step:
+    # Variable num_recur per step: compile blocks individually to avoid recompilation
+    # from the Python loop count changing. forward() runs eagerly, compiled blocks reused.
+    model.compile_blocks()
+else:
+    # Fixed num_recur: compile entire model as a single graph (optimal fusion)
+    model = torch.compile(model)
 
 # Detailed parameter counts
 param_counts = orig_model.num_scaling_params()

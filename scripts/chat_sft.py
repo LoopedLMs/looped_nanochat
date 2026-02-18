@@ -111,8 +111,13 @@ if pretrain_batch_size is not None and args.device_batch_size > pretrain_batch_s
         f"FOOTGUN WARNING: base model training used device_batch_size {pretrain_batch_size}, did you pass in a good --device-batch-size to this script?"
     )
 orig_model = model
-# Use dynamic=False when recur sampling is enabled (varying num_recur causes recompilation otherwise)
-model = torch.compile(model, dynamic=bool(args.recur_samples_per_step))
+if args.recur_samples_per_step:
+    # Variable num_recur per step: compile blocks individually to avoid recompilation
+    # from the Python loop count changing. forward() runs eagerly, compiled blocks reused.
+    model.compile_blocks()
+else:
+    # Fixed num_recur: compile entire model as a single graph (optimal fusion)
+    model = torch.compile(model)
 size = model.config.size
 num_flops_per_token = model.estimate_flops()
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len  # tokens per iteration for a single rank

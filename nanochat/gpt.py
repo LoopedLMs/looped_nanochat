@@ -302,6 +302,24 @@ class GPT(nn.Module):
         )  # add batch and head dims for later broadcasting
         return cos, sin
 
+    def compile_blocks(self):
+        """
+        Compile individual transformer blocks for variable-length recurrence loops.
+
+        Instead of torch.compile(model) which recompiles on every unique num_recur value
+        (Python loop count changes trigger full retracing), this compiles each Block's
+        forward method with dynamic=False. The Python loop in forward() runs eagerly,
+        calling into compiled blocks each iteration — zero recompilations from varying
+        loop count, while the heavy compute (attention + MLP) stays compiled.
+
+        Compiles the forward *method* (not the module) to avoid wrapping blocks in
+        OptimizedModule, which would add _orig_mod. prefix to state_dict keys and
+        break checkpoint compatibility.
+        """
+        for section in ("prelude", "recur", "coda"):
+            for block in self.transformer[section]:
+                block.forward = torch.compile(block.forward, dynamic=False)
+
     def _compute_window_sizes(self, config: GPTConfig):
         """
         Compute per-layer window sizes for sliding window attention.

@@ -3,6 +3,8 @@ name: read-arxiv-paper
 description: Use this skill when when asked to read an arxiv paper given an arxiv URL
 ---
 
+All file paths below are relative to the **project root** (the directory containing the `.claude/` folder, not the skill directory itself).
+
 You will be given a URL of an arxiv paper, for example:
 
 https://www.arxiv.org/abs/2601.07372
@@ -18,8 +20,6 @@ Notice the /src/ in the url. Once you have the URL:
 ### Part 2: Download the paper source
 
 Fetch the url to a local .tar.gz file.
-
-(If the file already exists, there is no need to re-download it).
 
 ### Part 3: Unpack the file in that folder
 
