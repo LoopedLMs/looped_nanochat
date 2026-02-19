@@ -404,6 +404,10 @@ class GPT(nn.Module):
         - Chinchilla counts the embedding layer as flops (? weird, it's just a lookup => we ignore)
         - Chinchilla counts exp/sum/divide in attention softmax as flops (a little sus and very tiny => we ignore)
 
+        Truncated BPTT: when bptt_k < num_recur, early recurrences are detached and only
+        incur forward cost (2x matmul, 4x attention), while the last bptt_k recurrences
+        carry gradients and incur full fwd+bwd cost (6x matmul, 12x attention).
+
         Args:
             num_recur: Number of recurrences to assume. If None, uses train_recur_mean.
         """
@@ -416,6 +420,15 @@ class GPT(nn.Module):
             self.config.sequence_len,
         )
 
+        # Truncated BPTT splits recurrences into forward-only (detached) and full (fwd+bwd)
+        bptt_k = self.config.bptt_k
+        if bptt_k is not None and bptt_k < num_recur:
+            fwd_only_recurs = num_recur - bptt_k
+            full_recurs = bptt_k
+        else:
+            fwd_only_recurs = 0
+            full_recurs = num_recur
+
         # 1. Count parameters by section
         prelude_params = sum(p.numel() for p in self.transformer.prelude.parameters())
         recur_params = sum(p.numel() for p in self.transformer.recur.parameters())
@@ -424,30 +437,28 @@ class GPT(nn.Module):
         lm_head_params = sum(p.numel() for p in self.lm_head.parameters())
 
         # 2. Matmul FLOPs weighted by usage
-        matmul_flops = 6 * (
-            prelude_params  # prelude runs 1x
-            + recur_params * num_recur  # recur runs num_recur times
-            + coda_params  # coda runs 1x
-            + inject_params * num_recur  # inject runs num_recur times (0 if passthrough)
-            + lm_head_params  # lm_head runs 1x
+        # Non-recurrent parts: always full fwd+bwd (6x)
+        # Recurrent parts: 2x (fwd only) for detached iters, 6x (fwd+bwd) for gradient iters
+        matmul_flops = (
+            6 * (prelude_params + coda_params + lm_head_params)
+            + (2 * fwd_only_recurs + 6 * full_recurs) * recur_params
+            + (2 * fwd_only_recurs + 6 * full_recurs) * inject_params
         )
 
         # 3. Attention FLOPs weighted by usage
+        # Same split: 4x (fwd only) for detached recurrences, 12x (fwd+bwd) for gradient ones
         attn_flops = 0
         num_layers = self.config.n_prelude + self.config.n_recur_block + self.config.n_coda
         for layer_idx in range(num_layers):
             window = self.window_sizes[layer_idx][0]
             effective_seq = min(window, t)
 
-            # Determine how many times this layer runs
             if layer_idx < self.config.n_prelude:
-                multiplier = 1  # prelude
+                attn_flops += 12 * h * q * effective_seq  # prelude: 1x, full
             elif layer_idx < self.config.n_prelude + self.config.n_recur_block:
-                multiplier = num_recur  # recur
+                attn_flops += (4 * fwd_only_recurs + 12 * full_recurs) * h * q * effective_seq
             else:
-                multiplier = 1  # coda
-
-            attn_flops += 12 * h * q * effective_seq * multiplier
+                attn_flops += 12 * h * q * effective_seq  # coda: 1x, full
 
         num_flops_per_token = matmul_flops + attn_flops
         return num_flops_per_token

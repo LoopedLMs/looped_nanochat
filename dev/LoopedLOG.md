@@ -4,6 +4,18 @@ Running log of experiments on the looped (depth-recurrent) transformer, forked f
 
 **Goal:** Exploratory work on understanding looped LLM behavior from the ground up. Small model sizes, limited compute budget, single runs for quick iteration. The end goal is a model with true dynamic compute and meaningful depth scaling at reasonable cost.
 
+## 2026-02-19: Corrected FLOPs Computation for Truncated Backpropagation
+
+`estimate_flops()` previously applied the full 6x multiplier (2 fwd + 4 bwd) to all recurrence iterations. With truncated BPTT (`bptt_k`), early detached iterations only incur forward cost (2x matmul, 4x attention), while only the last `bptt_k` iterations carry gradients (6x matmul, 12x attention). The old formula overcounted training FLOPs when `num_recur > bptt_k`. Same fix applied to attention FLOPs in recurrent layers.
+
+**Impact on iso-FLOP training (S12, r=6, bptt_k=4, target=2.15e18):** The corrected (lower) per-token FLOP estimate means more training steps fit within the same budget: 2573 vs. 2167 steps. This yields noticeably lower val loss: **0.9186 bpb** (corrected) vs. 0.9281 bpb (old).
+
+**Full backprop baseline (S12, r=6, bptt_k=6):** Training without truncation at the old step count (2167 steps) gives 0.9277 bpb — negligible improvement over the old truncated run at equal steps, but worse under iso-FLOPs since each step costs more without truncation.
+
+**Takeaway:** Truncated BPTT at `bptt_k=4` loses almost nothing in gradient quality but saves significant compute per step, which translates to more training steps and better final loss under a fixed FLOP budget.
+
+**Future work:** curriculum learning over recurrence depth to save FLOPs early in training.
+
 ## 2026-02-17: Post-Hoc Learned Exit Gate — Negative Result
 
 -> See branch "gating" for implementation, logs in `logs/exit_gate_train/`
