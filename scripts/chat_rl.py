@@ -34,8 +34,9 @@ from nanochat.common import (
     compute_gradient_stats,
     compute_init,
     get_base_dir,
+    get_num_recur_for_microstep,
     print0,
-    sample_poisson_lognormal_recurrence,
+    sample_num_recurs_for_step,
 )
 from nanochat.engine import Engine
 from nanochat.report import get_report
@@ -90,8 +91,13 @@ parser.add_argument("--eval-examples", type=int, default=400, help="number of ex
 parser.add_argument("--save-every", type=int, default=60, help="save checkpoint every N steps")
 # Recurrence options
 parser.add_argument('-rws', '--use-rec-warm-start', action='store_true', help='Use recurrent warm-start (carry recurrent state when decoding tokens)')
-parser.add_argument('-kb', '--kv-budget', type=int, default=1, help='Fixed KV-cache budget for recurrences. Default=1 (only cache final recurrence)')
-parser.add_argument("--no-sample-recur", action="store_true", help="disable sampling num_recur; use fixed train_recur_mean instead")
+parser.add_argument('-kb', '--kv-budget', type=int, default=1, help='KV-cache budget for recurrences. 1=cache final only, -1=full cache (budget=num_recur)')
+parser.add_argument(
+    "--recur-samples-per-step",
+    type=int,
+    default=0,
+    help="Number of different num_recur values per step (0 = fixed, use model default)",
+)
 parser.add_argument('--latent-thoughts', action='store_true', help='Cache recurrent states from rollout generation and replay (detached) during training forward pass')
 # Gradient tracking
 parser.add_argument(
@@ -134,6 +140,13 @@ print0(f"Calculated number of steps: {num_steps}")
 current_step_num_recur = None
 
 
+def resolve_kv_budget(kv_budget: int, num_recur: int | None) -> int:
+    """Resolve kv_budget: -1 means full cache (budget = num_recur)."""
+    if kv_budget == -1:
+        return num_recur if num_recur is not None else int(model.config.train_recur_mean)
+    return kv_budget
+
+
 @torch.no_grad()
 def get_batch() -> Generator[tuple[list[list[int]], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None], None, None]:
     assistant_end = tokenizer.encode_special("<|assistant_end|>")  # ok to use this token, it's only for padding and isn't used in the loss.
@@ -165,7 +178,7 @@ def get_batch() -> Generator[tuple[list[list[int]], torch.Tensor, torch.Tensor, 
                     seed=seed,  # must make sure to change the seed for each sampling step
                     num_recur=current_step_num_recur,  # use the step's num_recur for on-policy consistency
                     use_warm_start=generation_use_warm_start,
-                    kv_budget=args.kv_budget,
+                    kv_budget=resolve_kv_budget(args.kv_budget, current_step_num_recur),
                 )
             if args.latent_thoughts and engine._latent_cache is not None:
                 latent_caches.append(torch.cat(engine._latent_cache, dim=1))  # (device_bs, num_steps+1, n_embd)
@@ -256,7 +269,7 @@ def run_gsm8k_eval(
             top_k=top_k,
             num_recur=None,
             use_warm_start=use_warm_start,
-            kv_budget=kv_budget,
+            kv_budget=resolve_kv_budget(kv_budget, None),
         )
         # Check each sample for correctness
         outcomes = []
@@ -302,19 +315,38 @@ assert args.examples_per_step % ddp_world_size == 0, "Desired examples per step 
 examples_per_rank = args.examples_per_step // ddp_world_size  # per GPU
 print0(f"Calculated examples per rank: {examples_per_rank}")
 
+# Validate recur-samples-per-step (maps examples across ranks to num_recur values)
+if args.recur_samples_per_step:
+    if args.recur_samples_per_step > args.examples_per_step:
+        raise ValueError(
+            f"--recur-samples-per-step ({args.recur_samples_per_step}) cannot exceed total examples per step ({args.examples_per_step}). "
+            f"Decrease --recur-samples-per-step or increase --examples-per-step."
+        )
+    if args.examples_per_step % args.recur_samples_per_step != 0:
+        raise ValueError(
+            f"Total examples per step ({args.examples_per_step} = {ddp_world_size} ranks * {examples_per_rank} examples) must be evenly divisible by --recur-samples-per-step ({args.recur_samples_per_step}). "
+            f"Adjust --examples-per-step or --recur-samples-per-step."
+        )
+    examples_per_sample = args.examples_per_step // args.recur_samples_per_step
+    print0(f"Recurrence sampling: {args.recur_samples_per_step} global samples per step ({examples_per_sample} examples each across {ddp_world_size} ranks)")
+else:
+    print0(f"Recurrence sampling: fixed (using model default)")
+
 # Kick off the training loop
 batch_iterator = get_batch()
 for step in range(num_steps):
-    # Sample num_recur for this entire step (maintains on-policy consistency)
-    # If --no-sample-recur is set, use None to let the model use its default (train_recur_mean)
-    if args.no_sample_recur:
-        current_step_num_recur = None
-    else:
-        current_step_num_recur = sample_poisson_lognormal_recurrence(
-            mean_recur=model.config.train_recur_mean,
-            sigma=0.5,
-            max_recur=model.config.train_recur_max,
-        )
+    # Pre-sample all num_recur values for this step (global across all ranks)
+    sampled_num_recurs = sample_num_recurs_for_step(
+        recur_samples_per_step=args.recur_samples_per_step,
+        mean_recur=model.config.train_recur_mean,
+        sigma=0.5,
+        max_recur=model.config.train_recur_max,
+        ddp=ddp,
+        master_process=master_process,
+        device=device,
+    )
+    # Set default for generation (eval uses model default, first example will override)
+    current_step_num_recur = None
 
     # Evaluate the model once in a while and log to wandb
     if step % args.eval_every == 0:
@@ -353,6 +385,15 @@ for step in range(num_steps):
     rewards_list = []
     sequence_lengths = []
     for example_step in range(examples_per_rank):
+        # Get num_recur for this example (on-policy: same for generation and training)
+        current_step_num_recur = get_num_recur_for_microstep(
+            sampled_num_recurs=sampled_num_recurs,
+            micro_step=example_step,
+            ddp_rank=ddp_rank,
+            ddp_world_size=ddp_world_size,
+            grad_accum_steps=examples_per_rank,
+            recur_samples_per_step=args.recur_samples_per_step,
+        )
         # Get one batch corresponding to one example in the training dataset
         sequences_all, inputs_all, targets_all, rewards_all, advantages_all, ws_all, ws_mask_all = next(batch_iterator)
         # Evaluate the loss and gradients
@@ -401,10 +442,15 @@ for step in range(num_steps):
         dist.all_reduce(mean_sequence_length_tensor, op=dist.ReduceOp.AVG)
         mean_reward = mean_reward_tensor.item()
         mean_sequence_length = mean_sequence_length_tensor.item()
-    # For logging: use actual num_recur if sampled, otherwise the fixed default
-    logged_num_recur = current_step_num_recur if current_step_num_recur is not None else int(model.config.train_recur_mean)
+    # For logging: report num_recur info
+    if sampled_num_recurs is None:
+        logged_num_recur = int(model.config.train_recur_mean)
+        logged_num_recur_str = f"{logged_num_recur}"
+    else:
+        logged_num_recur = sum(sampled_num_recurs) / len(sampled_num_recurs)
+        logged_num_recur_str = f"{sampled_num_recurs} (mean={logged_num_recur:.1f})"
     print0(
-        f"Step {step}/{num_steps} | Average reward: {mean_reward} | Average sequence length: {mean_sequence_length:.2f} | num_recur: {logged_num_recur}"
+        f"Step {step}/{num_steps} | Average reward: {mean_reward} | Average sequence length: {mean_sequence_length:.2f} | num_recur: {logged_num_recur_str}"
     )
     wandb_run.log(
         {
