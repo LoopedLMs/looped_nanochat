@@ -1,0 +1,8 @@
+date,name,branch,size,num_recur,sample_recur,bptt_k,input_injection,flops_per_tok,target_flops,tokens,batch_size,device_batch_size,steps,embedding_lr,unembedding_lr,matrix_lr,val_bpb,train_time_h,gpus,notes
+2026-02-19,r6_s12_inject_bptt6,master,S12,6,false,6,inject_init_prelude,1.893e9,2.15e18,1136132096,524288,16,2167,0.3,0.004,0.02,0.9277,1.82,2xA100-SXM4-80GB,r6 with full bptt
+2026-02-19,r6_s12_inject_bptt4,master,S12,6,false,4,inject_init_prelude,1.594e9,2.15e18,1348993024,524288,32,2573,0.3,0.004,0.02,0.9186,1.78,2xA100-SXM4-80GB,r6 with truncated bptt
+2026-02-19,r4_s12_passthrough,master,S12,4,false,4,passthrough,1.416e9,2.15e18,1518338048,524288,32,2896,0.3,0.004,0.02,0.9350,1.79,2xA100-SXM4-80GB,r4 no injection baseline
+2026-02-20,r4_2.15e18_s12,master,S12,4,false,4,inject_init_prelude,1.444258e+09,2.15e18,1488453632,524288,32,2839,0.3,0.004,0.02,0.914286,0.77,2xNVIDIA H100,r4 baseline
+2026-02-20,r4_2.15e18_s12_recur-warmup-0-6,master,S12,4,false,4,inject_init_prelude,1.444258e+09,2.15e18,1856503808,524288,32,3541,0.3,0.004,0.02,0.905568,1.84,2xNVIDIA A100-SXM4-80GB,trying warmup number of recursions
+2026-02-20,r4_2.15e18_s12_recur-warmup-0-4,master,S12,4,false,4,inject_init_prelude,1.444258e+09,2.15e18,1715470336,524288,32,3272,0.3,0.004,0.02,0.909357,1.83,2xNVIDIA A100-SXM4-80GB,trying warmup number of recursions
+2026-02-20,r4_2.15e18_s12_recur-warmup-0-2,master,S12,4,false,4,inject_init_prelude,1.444258e+09,2.15e18,1594359808,524288,32,3041,0.3,0.004,0.02,0.911514,1.81,2xNVIDIA A100-SXM4-80GB,trying warmup number of recursions

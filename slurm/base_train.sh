@@ -24,6 +24,7 @@ SIZE=12
 NUM_RECUR=4
 SAMPLE_R=false # set to true for recursion sampling
 BPTT_K=4
+RECUR_WARMUP_RATIO=0.0  # -1 = auto (1 - warmdown_ratio), 0 = disabled
 DEVICE_BATCH_SIZE=32
 TAG_SUFFIX=""
 # --- Less common ---
@@ -56,6 +57,7 @@ torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train \
     --train-recur-mean=$NUM_RECUR \
     --train-recur-max=16 \
     --bptt-k=$BPTT_K \
+    --recur-warmup-ratio=$RECUR_WARMUP_RATIO \
     --input-injection=$INPUT_INJECTION \
     --embedding-lr=$EMBEDDING_LR \
     --unembedding-lr=$UNEMBEDDING_LR \
@@ -70,7 +72,7 @@ if [ $TRAIN_EXIT -eq 0 ] && grep -q "Minimum validation bpb" "$TRAIN_LOG"; then
     FLOPS_PER_TOK=$(grep -oP 'Estimated FLOPs per token: \K[\d.e+]+' "$TRAIN_LOG" | head -1)
     TOKENS=$(grep -oP 'Total number of training tokens: \K[\d,]+' "$TRAIN_LOG" | head -1 | tr -d ',')
     BATCH_SIZE=$(grep -oP 'Total batch size \K[\d,]+' "$TRAIN_LOG" | head -1 | tr -d ',')
-    STEPS=$(grep -oP 'Calculated number of iterations from target FLOPs: \K[\d,]+' "$TRAIN_LOG" | head -1 | tr -d ',')
+    STEPS=$(grep -oP 'Calculated number of iterations from target FLOPs[^:]*: \K[\d,]+' "$TRAIN_LOG" | head -1 | tr -d ',')
     VAL_BPB=$(grep -oP 'Minimum validation bpb: \K[\d.]+' "$TRAIN_LOG")
     TRAIN_TIME_M=$(grep -oP 'Total training time: \K[\d.]+' "$TRAIN_LOG")
     TRAIN_TIME_H=$(python3 -c "print(f'{${TRAIN_TIME_M}/60:.2f}')")

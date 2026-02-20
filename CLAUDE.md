@@ -39,6 +39,9 @@ Python scripts must be run within the uv environment:
 ## Debugging
 Check `.venv` source code directly for library implementation details
 
+## Project Paths
+`NANOCHAT_BASE_DIR` (where results, checkpoints, and plots are saved) is configured in `slurm/machine_config.sh`. Check there for the current value.
+
 ## Background Knowledge
 Paper summaries and research notes live in `./knowledge/`. Check there for context on relevant prior work (e.g. layer redundancy, recurrence retrofitting). The paper behind this repository is summarized in knowledge/summary_retrofitting_recurrence.md.
 

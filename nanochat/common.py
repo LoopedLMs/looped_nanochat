@@ -242,6 +242,122 @@ def get_num_recur_for_microstep(
     return sampled_num_recurs[sample_idx]
 
 
+# ---------------------------------------------------------------------------
+# Recurrence curriculum scheduling (arXiv:2511.07384)
+# ---------------------------------------------------------------------------
+
+def get_scheduled_recur_mean(
+    step: int,
+    num_iterations: int,
+    target_mean: float,
+    recur_warmup_ratio: float,
+) -> float:
+    """
+    Compute the scheduled recurrence mean for a given training step.
+
+    Uses a 1-sqrt schedule during warmup: mean = ceil(target * (1 - sqrt(1 - t/W))),
+    clamped to [1.0, target_mean]. After warmup completes, returns target_mean.
+
+    Based on curriculum learning for recurrence depth (McLeish et al., arXiv:2511.07384).
+
+    Args:
+        step: Current optimization step (0-indexed)
+        num_iterations: Total number of optimization steps
+        target_mean: Target (final) mean recurrence depth
+        recur_warmup_ratio: Fraction of training for recurrence warmup (0.0 = no ramp)
+
+    Returns:
+        Scheduled mean recurrence for this step (float, >= 1.0)
+    """
+    if recur_warmup_ratio <= 0.0 or num_iterations <= 0:
+        return target_mean
+
+    warmup_steps = round(recur_warmup_ratio * num_iterations)
+    if step >= warmup_steps or warmup_steps == 0:
+        return target_mean
+
+    progress = step / warmup_steps
+    raw = target_mean * (1.0 - math.sqrt(1.0 - progress))
+    return max(1.0, math.ceil(raw))
+
+
+def compute_cumulative_flops(
+    estimate_flops_fn,
+    num_steps: int,
+    num_iterations: int,
+    target_mean: float,
+    recur_warmup_ratio: float,
+    tokens_per_step: int,
+) -> float:
+    """
+    Compute total training FLOPs for steps [0, num_steps), accounting for
+    recurrence curriculum ramping.
+
+    Caches estimate_flops_fn results since there are only ~ceil(target_mean)
+    distinct integer recurrence values across the schedule.
+
+    Args:
+        estimate_flops_fn: Callable(num_recur: int) -> flops_per_token
+        num_steps: Number of steps to sum over
+        num_iterations: Total training iterations (for schedule computation)
+        target_mean: Target mean recurrence
+        recur_warmup_ratio: Warmup ratio for recurrence ramp
+        tokens_per_step: Tokens per optimization step (total_batch_size)
+
+    Returns:
+        Total FLOPs across the given steps
+    """
+    cache: dict[int, float] = {}
+    total_flops = 0.0
+    for s in range(num_steps):
+        mean_r = int(get_scheduled_recur_mean(s, num_iterations, target_mean, recur_warmup_ratio))
+        if mean_r not in cache:
+            cache[mean_r] = estimate_flops_fn(num_recur=mean_r)
+        total_flops += cache[mean_r] * tokens_per_step
+    return total_flops
+
+
+def solve_iterations_for_target_flops(
+    estimate_flops_fn,
+    target_flops: float,
+    target_mean: float,
+    recur_warmup_ratio: float,
+    tokens_per_step: int,
+) -> int:
+    """
+    Binary search for the number of iterations that achieves target_flops,
+    accounting for the recurrence curriculum.
+
+    Since cumulative FLOPs is monotonically increasing in N and the schedule
+    (warmup fraction) scales with N, binary search converges cleanly.
+
+    Args:
+        estimate_flops_fn: Callable(num_recur: int) -> flops_per_token
+        target_flops: Desired total training FLOPs
+        target_mean: Target mean recurrence depth
+        recur_warmup_ratio: Warmup ratio for recurrence ramp
+        tokens_per_step: Tokens per optimization step (total_batch_size)
+
+    Returns:
+        Number of iterations to reach target_flops
+    """
+    # Upper bound: all steps at cheapest cost (recur=1)
+    min_flops_per_step = estimate_flops_fn(num_recur=1) * tokens_per_step
+    hi = int(target_flops / min_flops_per_step) + 2
+    lo = 1
+
+    while lo < hi:
+        mid = (lo + hi) // 2
+        total = compute_cumulative_flops(
+            estimate_flops_fn, mid, mid, target_mean, recur_warmup_ratio, tokens_per_step,
+        )
+        if total < target_flops:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
 def is_ddp_requested() -> bool:
     """
     True if launched by torchrun (env present), even before init.

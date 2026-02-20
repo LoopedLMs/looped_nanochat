@@ -35,8 +35,11 @@ from nanochat.common import (
     get_peak_flops,
     print0,
     print_banner,
+    compute_cumulative_flops,
+    get_scheduled_recur_mean,
     sample_num_recurs_for_step,
     sample_poisson_lognormal_recurrence,
+    solve_iterations_for_target_flops,
 )
 from nanochat.dataloader import (
     tokenizing_distributed_data_loader_bos_bestfit,
@@ -112,6 +115,7 @@ parser.add_argument("--adam-beta1", type=float, default=0.8, help="Adam beta1 fo
 parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 for embedding/unembedding")
 parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.4, help="ratio of iterations for LR warmdown")
+parser.add_argument("--recur-warmup-ratio", type=float, default=0.0, help="ratio of iterations for recurrence curriculum warmup (-1.0 = auto: 1 - warmdown_ratio, 0.0 = disabled)")
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 # Evaluation
@@ -133,6 +137,9 @@ parser.add_argument(
     help="Gradient tracking level: none (disabled), basic (global norm), detailed (per-component norms)",
 )
 args = parser.parse_args()
+# Resolve sentinel: recurrence warmup fills the pre-warmdown portion of training by default
+if args.recur_warmup_ratio < 0:
+    args.recur_warmup_ratio = 1.0 - args.warmdown_ratio
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
 
@@ -291,8 +298,16 @@ if args.num_iterations > 0:
     num_iterations = args.num_iterations
     print0(f"Using user-provided number of iterations: {num_iterations:,}")
 elif args.target_flops > 0:
-    target_tokens = round(args.target_flops / num_flops_per_token)
-    print0(f"Target tokens from target FLOPs: {target_tokens:,}")
+    if args.recur_warmup_ratio > 0:
+        # With curriculum, FLOPs/step varies. Use analytical average for initial token estimate
+        # (only used to auto-compute batch size; num_iterations is set precisely below).
+        avg_recur = model_config.train_recur_mean * (1.0 - 2.0 * args.recur_warmup_ratio / 3.0)
+        avg_flops_per_token = model.estimate_flops(num_recur=max(1, round(avg_recur)))
+        target_tokens = round(args.target_flops / avg_flops_per_token)
+        print0(f"Target tokens from target FLOPs (approx, for batch size): {target_tokens:,}")
+    else:
+        target_tokens = round(args.target_flops / num_flops_per_token)
+        print0(f"Target tokens from target FLOPs: {target_tokens:,}")
 else:
     target_tokens = round(args.target_param_data_ratio * num_scaling_params)
     print0(f"Target tokens from data:param ratio {args.target_param_data_ratio}: {target_tokens:,}")
@@ -309,11 +324,20 @@ if args.num_iterations <= 0:
         predicted_batch_size = B_REF * batch_size_ratio ** 0.383
         total_batch_size = 2 ** round(math.log2(predicted_batch_size))
         print0(f"Auto-computed optimal batch size: {total_batch_size:,} tokens")
-    num_iterations = round(target_tokens / total_batch_size)
-    if args.target_flops > 0:
-        print0(f"Calculated number of iterations from target FLOPs: {num_iterations:,}")
+    if args.target_flops > 0 and args.recur_warmup_ratio > 0:
+        # Precise: binary search for num_iterations accounting for curriculum FLOPs
+        num_iterations = solve_iterations_for_target_flops(
+            orig_model.estimate_flops, args.target_flops,
+            model_config.train_recur_mean, args.recur_warmup_ratio, total_batch_size,
+        )
+        target_tokens = num_iterations * total_batch_size
+        print0(f"Calculated number of iterations from target FLOPs (with curriculum): {num_iterations:,}")
     else:
-        print0(f"Calculated number of iterations from target data:param ratio: {num_iterations:,}")
+        num_iterations = round(target_tokens / total_batch_size)
+        if args.target_flops > 0:
+            print0(f"Calculated number of iterations from target FLOPs: {num_iterations:,}")
+        else:
+            print0(f"Calculated number of iterations from target data:param ratio: {num_iterations:,}")
 
 # Gradient accumulation
 assert total_batch_size % world_tokens_per_fwdbwd == 0, (
@@ -434,6 +458,7 @@ if not resuming:
     min_val_bpb = float("inf")
     smooth_train_loss = 0  # EMA of training loss
     total_training_time = 0  # total wall-clock time of training
+    cumulative_flops = 0.0
 else:
     step = meta_data["step"]
     loop_state = meta_data["loop_state"]
@@ -441,12 +466,21 @@ else:
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
+    # Recompute cumulative FLOPs from schedule (deterministic, no need to checkpoint)
+    cumulative_flops = compute_cumulative_flops(
+        orig_model.estimate_flops, step, num_iterations,
+        model_config.train_recur_mean, args.recur_warmup_ratio, total_batch_size,
+    )
+    print0(f"Recomputed cumulative FLOPs up to step {step}: {cumulative_flops:e}")
 
 # -----------------------------------------------------------------------------
 # Training loop
 while True:
     last_step = step == num_iterations  # loop runs num_iterations+1 times so that we can eval/save at the end
-    flops_so_far = num_flops_per_token * total_batch_size * step
+    # Curriculum: compute scheduled recurrence mean for this step
+    current_recur_mean = get_scheduled_recur_mean(step, num_iterations, model_config.train_recur_mean, args.recur_warmup_ratio)
+    current_flops_per_token = orig_model.estimate_flops(num_recur=int(current_recur_mean))
+    flops_so_far = cumulative_flops
 
     # once in a while: evaluate the val bpb (all ranks participate)
     if args.eval_every > 0 and (last_step or (step > 0 and step % args.eval_every == 0)):
@@ -549,7 +583,7 @@ while True:
     # Pre-sample all num_recur values for this step (global across all ranks)
     sampled_num_recurs = sample_num_recurs_for_step(
         recur_samples_per_step=args.recur_samples_per_step,
-        mean_recur=model_config.train_recur_mean,
+        mean_recur=current_recur_mean,
         sigma=0.5,
         max_recur=model_config.train_recur_max,
         ddp=ddp,
@@ -567,6 +601,9 @@ while True:
             grad_accum_steps=grad_accum_steps,
             recur_samples_per_step=args.recur_samples_per_step,
         )
+        # When sampling is disabled, use the scheduled recurrence mean directly
+        if num_recur is None:
+            num_recur = int(current_recur_mean)
         with autocast_ctx:
             loss = model(x, y, num_recur=num_recur)
         train_loss = loss.detach()  # for logging
@@ -606,7 +643,7 @@ while True:
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta ** (step + 1))  # debias the EMA
     pct_done = 100 * step / num_iterations
     tok_per_sec = int(total_batch_size / dt)
-    flops_per_sec = num_flops_per_token * total_batch_size / dt
+    flops_per_sec = current_flops_per_token * total_batch_size / dt
     mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
     if step > 10:
         total_training_time += dt  # only count the time after the first 10 steps
@@ -626,7 +663,7 @@ while True:
     if step % 100 == 0:
         # For logging: report num_recur info
         if sampled_num_recurs is None:
-            logged_num_recur = int(model_config.train_recur_mean)
+            logged_num_recur = int(current_recur_mean)
         else:
             logged_num_recur = sum(sampled_num_recurs) / len(sampled_num_recurs)
         log_data = {
@@ -641,6 +678,7 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
             "train/num_recur": logged_num_recur,
+            "train/recur_mean_scheduled": current_recur_mean,
             "lr/muon": effective_lr_muon,           # effective learning rate for Muon (matrix params)
             "lr/embed": effective_lr_embed,         # effective learning rate for embeddings
             "lr/unembed": effective_lr_unembed,     # effective learning rate for unembedding (lm_head)
@@ -650,6 +688,7 @@ while True:
         wandb_run.log(log_data)
 
     # state update
+    cumulative_flops += current_flops_per_token * total_batch_size
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
     step += 1
 
