@@ -539,7 +539,7 @@ class GPT(nn.Module):
         effective = once + (reused * num_recur)
         return effective
 
-    def _state_transfer(self, e, s=None, warm_start_state=None):
+    def _state_transfer(self, e, s=None, warm_start_state=None, warm_start_mask=None):
         """
         Handle state initialization and input injection based on input_injection mode.
 
@@ -551,6 +551,8 @@ class GPT(nn.Module):
             e: Prelude output (B, T, n_embd)
             s: Current recurrent state (B, T, n_embd), or None for initial recurrence
             warm_start_state: Optional warm-start state from previous token (B, 1, n_embd) or (B, T, n_embd)
+            warm_start_mask: Optional bool mask (B, T). True = use warm_start, False = use default init.
+                Only used on first recurrence when warm_start_state is provided.
 
         Returns:
             Input to the recurrent block u (B, T, n_embd)
@@ -565,6 +567,13 @@ class GPT(nn.Module):
                     s = warm_start_state.expand(-1, T, -1)
                 else:
                     s = warm_start_state
+                # Where mask is False, fall back to default initial state (prelude output)
+                if warm_start_mask is not None:
+                    if self.config.input_injection == "inject_init_random":
+                        default_s = torch.randn_like(e) * (self.config.n_embd ** -0.5)
+                    else:
+                        default_s = e
+                    s = torch.where(warm_start_mask.unsqueeze(-1), s, default_s)
             elif self.config.input_injection == "inject_init_random":
                 # Sample initial state from N(0, 1/sqrt(d)) per Geiping et al. Section 3.3
                 noise_std = self.config.n_embd ** -0.5
@@ -690,6 +699,7 @@ class GPT(nn.Module):
         loss_reduction="mean",
         num_recur=None,
         warm_start_state=None,
+        warm_start_mask=None,
         return_intermediate_logits: bool = False,
         return_intermediate_states: bool = False,
     ):
@@ -741,7 +751,7 @@ class GPT(nn.Module):
         # 4. Recurrent block (run num_recur times)
         for i in range(num_recur):
             # State transfer: handles initialization (on i==0) and input injection
-            u = self._state_transfer(e, s=s, warm_start_state=warm_start_state)
+            u = self._state_transfer(e, s=s, warm_start_state=warm_start_state, warm_start_mask=warm_start_mask)
             # Run recur blocks with KV cache
             for j, block in enumerate(self.transformer.recur):
                 layer_idx = self._get_kv_layer_idx("recur", j, kv_budget, recur_iter=i)

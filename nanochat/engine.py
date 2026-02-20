@@ -316,6 +316,7 @@ class Engine:
         """
         assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
         assert kv_budget >= 1, f"kv_budget must be >= 1, got {kv_budget}"
+        self._latent_cache = None
         device = self.model.get_device()
         # NOTE: setting the dtype here and in this way is an ugly hack.
         # Currently the repo assumes that cuda -> bfloat16 and everything else -> float32.
@@ -350,6 +351,8 @@ class Engine:
             logits, warm_start_state = self.model.forward(ids, kv_cache=kv_cache_prefill, num_recur=num_recur)
         logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
         warm_start_state = warm_start_state[:, -1:, :].expand(num_samples, -1, -1)  # (num_samples, 1, hidden_dim)
+        if use_warm_start:
+            self._latent_cache = [warm_start_state.clone()]  # cache[0] = state from prefill
 
         # 2) Replicate the KV cache for each sample/row
         kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
@@ -403,6 +406,8 @@ class Engine:
                     num_recur=num_recur,
                     warm_start_state=warm_start_state if use_warm_start else None,
                 )
+            if self._latent_cache is not None:
+                self._latent_cache.append(warm_start_state.clone())
             logits = logits[:, -1, :]  # (B, vocab_size)
 
     @torch.inference_mode()

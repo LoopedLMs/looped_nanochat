@@ -4,6 +4,31 @@ Running log of experiments on the looped (depth-recurrent) transformer, forked f
 
 **Goal:** Exploratory work on understanding looped LLM behavior from the ground up. Small model sizes, limited compute budget, single runs for quick iteration. The end goal is a model with true dynamic compute and meaningful depth scaling at reasonable cost.
 
+## 2026-02-20: Recurrence Warmup — Curriculum over Depth Saves FLOPs
+
+Tested curriculum learning over recursion depth (future work from 2026-02-19). Uses a 1-sqrt schedule from McLeish et al. (arXiv:2511.07384): `num_recur = ceil(target * (1 - sqrt(1 - t/W)))`, ramping from 1 to target over warmup fraction W. During warmup, fewer recursions = lower FLOPs/tok, so more training steps fit in the same FLOP budget. S12, r=4, bptt_k=4, `inject_init_prelude`, 2.15e18 target FLOPs.
+
+| Model | Warmup ratio | Steps | Tokens | Val BPB |
+|-------|-------------|-------|--------|---------|
+| r4 baseline | — | 2839 | 1.49B | 0.9143 |
+| recur-warmup-0.2 | 0.2 | 3041 | 1.59B | 0.9115 |
+| recur-warmup-0.4 | 0.4 | 3272 | 1.72B | 0.9094 |
+| recur-warmup-0.6 | 0.6 | 3541 | 1.86B | **0.9056** |
+
+**No instability at recursion transitions.** Loss curves show no spikes when the scheduled recursion count increases — the model absorbs additional depth smoothly.
+
+**More warmup = more tokens = lower loss.** The best run (W=0.6) fits 25% more steps than the baseline, yielding **0.0087 bpb improvement** — larger than any hyperparameter change from 2026-02-08. The relationship is monotonic: longer warmup → cheaper early steps → more total tokens → better final loss.
+
+**Takeaway:** Recurrence warmup is free lunch under iso-FLOP training. Combined with truncated BPTT (2026-02-19), this is the second lever for squeezing more training out of a fixed compute budget.
+
+---
+
+## 2026-02-19: Passthrough Baseline — Input Injection Matters
+
+Trained r=4, S12 without input injection (passthrough, inject params = 0) at 2.15e18 FLOPs. Val BPB: **0.9350** — significantly worse than the r=4 with `inject_init_prelude` from 2026-02-11 (0.9144), despite seeing slightly more tokens (1.52B vs 1.49B) due to lower FLOPs/tok. Input injection provides ~0.02 bpb improvement at r=4.
+
+---
+
 ## 2026-02-19: Corrected FLOPs Computation for Truncated Backpropagation
 
 `estimate_flops()` previously applied the full 6x multiplier (2 fwd + 4 bwd) to all recurrence iterations. With truncated BPTT (`bptt_k`), early detached iterations only incur forward cost (2x matmul, 4x attention), while only the last `bptt_k` iterations carry gradients (6x matmul, 12x attention). The old formula overcounted training FLOPs when `num_recur > bptt_k`. Same fix applied to attention FLOPs in recurrent layers.
@@ -15,6 +40,8 @@ Running log of experiments on the looped (depth-recurrent) transformer, forked f
 **Takeaway:** Truncated BPTT at `bptt_k=4` loses almost nothing in gradient quality but saves significant compute per step, which translates to more training steps and better final loss under a fixed FLOP budget.
 
 **Future work:** curriculum learning over recurrence depth to save FLOPs early in training.
+
+---
 
 ## 2026-02-17: Post-Hoc Learned Exit Gate — Negative Result
 

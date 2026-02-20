@@ -92,6 +92,7 @@ parser.add_argument("--save-every", type=int, default=60, help="save checkpoint 
 parser.add_argument('-rws', '--use-rec-warm-start', action='store_true', help='Use recurrent warm-start (carry recurrent state when decoding tokens)')
 parser.add_argument('-kb', '--kv-budget', type=int, default=1, help='Fixed KV-cache budget for recurrences. Default=1 (only cache final recurrence)')
 parser.add_argument("--no-sample-recur", action="store_true", help="disable sampling num_recur; use fixed train_recur_mean instead")
+parser.add_argument('--latent-thoughts', action='store_true', help='Cache recurrent states from rollout generation and replay (detached) during training forward pass')
 # Gradient tracking
 parser.add_argument(
     "--track-gradients",
@@ -102,6 +103,8 @@ parser.add_argument(
 )
 args = parser.parse_args()
 user_config = vars(args).copy()
+# latent_thoughts implies warm_start during generation (need states to cache)
+generation_use_warm_start = args.use_rec_warm_start or args.latent_thoughts
 # -----------------------------------------------------------------------------
 
 # Init compute/precision
@@ -132,7 +135,7 @@ current_step_num_recur = None
 
 
 @torch.no_grad()
-def get_batch() -> Generator[tuple[list[list[int]], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], None, None]:
+def get_batch() -> Generator[tuple[list[list[int]], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None], None, None]:
     assistant_end = tokenizer.encode_special("<|assistant_end|>")  # ok to use this token, it's only for padding and isn't used in the loss.
     rank_indices = range(ddp_rank, len(train_task), ddp_world_size)  # each rank is responsible for different examples in the training data
     for example_idx in itertools.cycle(rank_indices):
@@ -148,6 +151,7 @@ def get_batch() -> Generator[tuple[list[list[int]], torch.Tensor, torch.Tensor, 
         model.eval()  # ensure the model is in eval mode
         generated_token_sequences = []
         masks = []
+        latent_caches = []
         num_sampling_steps = args.num_samples // args.device_batch_size  # go sequentially to prevent OOMs
         for sampling_step in range(num_sampling_steps):
             seed = hash((step, example_idx, sampling_step)) & 0x7FFFFFFF  # positive half of int32
@@ -160,9 +164,11 @@ def get_batch() -> Generator[tuple[list[list[int]], torch.Tensor, torch.Tensor, 
                     top_k=args.top_k,
                     seed=seed,  # must make sure to change the seed for each sampling step
                     num_recur=current_step_num_recur,  # use the step's num_recur for on-policy consistency
-                    use_warm_start=args.use_rec_warm_start,
+                    use_warm_start=generation_use_warm_start,
                     kv_budget=args.kv_budget,
                 )
+            if args.latent_thoughts and engine._latent_cache is not None:
+                latent_caches.append(torch.cat(engine._latent_cache, dim=1))  # (device_bs, num_steps+1, n_embd)
             generated_token_sequences.extend(generated_token_sequences_batch)
             masks.extend(masks_batch)
 
@@ -194,8 +200,25 @@ def get_batch() -> Generator[tuple[list[list[int]], torch.Tensor, torch.Tensor, 
         # Calculate the advantages by simply subtracting the mean (instead of z-score (x-mu)/sigma)
         mu = rewards.mean()
         advantages = rewards - mu
+        # Build warm_start tensor and mask for latent thought replay during training
+        if args.latent_thoughts and latent_caches:
+            T = inputs.size(1)  # max_length - 1
+            n_embd = latent_caches[0].size(-1)
+            warm_start_states = torch.zeros(inputs.size(0), T, n_embd, device=device, dtype=ptdtype)
+            warm_start_mask = torch.zeros(inputs.size(0), T, device=device, dtype=torch.bool)
+            offset = 0
+            for batch_cache in latent_caches:
+                bs = batch_cache.size(0)
+                num_to_place = min(batch_cache.size(1), T - prefix_length)
+                if num_to_place > 0:
+                    warm_start_states[offset:offset + bs, prefix_length:prefix_length + num_to_place] = batch_cache[:, :num_to_place]
+                    warm_start_mask[offset:offset + bs, prefix_length:prefix_length + num_to_place] = True
+                offset += bs
+        else:
+            warm_start_states = None
+            warm_start_mask = None
         # yield inputs/targets as (B, T) of ids and rewards as (B,) of floats
-        yield generated_token_sequences, inputs, targets, rewards, advantages
+        yield generated_token_sequences, inputs, targets, rewards, advantages, warm_start_states, warm_start_mask
 
 
 # -----------------------------------------------------------------------------
@@ -305,7 +328,7 @@ for step in range(num_steps):
                 num_samples=args.device_batch_size,
                 max_examples=args.eval_examples,
                 temperature=1.0,
-                use_warm_start=args.use_rec_warm_start,
+                use_warm_start=generation_use_warm_start,
                 kv_budget=args.kv_budget,
             )
             records = list(records_iter)  # collect all records
@@ -331,7 +354,7 @@ for step in range(num_steps):
     sequence_lengths = []
     for example_step in range(examples_per_rank):
         # Get one batch corresponding to one example in the training dataset
-        sequences_all, inputs_all, targets_all, rewards_all, advantages_all = next(batch_iterator)
+        sequences_all, inputs_all, targets_all, rewards_all, advantages_all, ws_all, ws_mask_all = next(batch_iterator)
         # Evaluate the loss and gradients
         model.train()  # ensure the model is in train mode
         # We need one more loop because we can never exceed the device_batch_size
@@ -344,10 +367,14 @@ for step in range(num_steps):
             targets = targets_all[b0:b1]
             rewards = rewards_all[b0:b1]
             advantages = advantages_all[b0:b1]
+            # Latent thought replay: pass cached (detached) warm_start states from generation
+            ws = ws_all[b0:b1].detach() if ws_all is not None else None
+            ws_mask = ws_mask_all[b0:b1] if ws_mask_all is not None else None
             # Use the same num_recur that was used for rollout generation (on-policy consistency)
             # Calculate log probabilities. Note that the loss calculates NLL = -logp, so we negate
             with autocast_ctx:
-                logp = -model(inputs, targets, loss_reduction="none", num_recur=current_step_num_recur).view_as(inputs)  # (B, T)
+                logp = -model(inputs, targets, loss_reduction="none", num_recur=current_step_num_recur,
+                              warm_start_state=ws, warm_start_mask=ws_mask).view_as(inputs)  # (B, T)
             # Calculate the PG objective. Note that ignore_index=-1 ensures that invalid tokens have loss 0.
             pg_obj = (logp * advantages.unsqueeze(-1)).sum()
             # normalize by the number of valid tokens, number of passes, and examples_per_rank
