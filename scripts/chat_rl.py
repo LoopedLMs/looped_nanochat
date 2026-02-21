@@ -19,6 +19,7 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_rl -- --run=default
 import argparse
 import itertools
 import os
+import time
 from collections.abc import Generator
 from contextlib import nullcontext
 
@@ -231,7 +232,7 @@ def get_batch() -> Generator[tuple[list[list[int]], torch.Tensor, torch.Tensor, 
             warm_start_states = None
             warm_start_mask = None
         # yield inputs/targets as (B, T) of ids and rewards as (B,) of floats
-        yield generated_token_sequences, inputs, targets, rewards, advantages, warm_start_states, warm_start_mask
+        yield generated_token_sequences, inputs, targets, rewards, advantages, warm_start_states, warm_start_mask, prefix_length
 
 
 # -----------------------------------------------------------------------------
@@ -384,6 +385,12 @@ for step in range(num_steps):
     # Forward/Backward on rollouts over multiple examples in the dataset
     rewards_list = []
     sequence_lengths = []
+    num_zero_advantage = 0  # count questions where all advantages are zero (no learning signal)
+    num_truncated = 0  # count sequences that hit max_new_tokens without EOS
+    num_total_sequences = 0
+    surrogate_loss_accum = 0.0
+    t_generation = 0.0
+    t_training = 0.0
     for example_step in range(examples_per_rank):
         # Get num_recur for this example (on-policy: same for generation and training)
         current_step_num_recur = get_num_recur_for_microstep(
@@ -395,14 +402,23 @@ for step in range(num_steps):
             recur_samples_per_step=args.recur_samples_per_step,
         )
         # Get one batch corresponding to one example in the training dataset
-        sequences_all, inputs_all, targets_all, rewards_all, advantages_all, ws_all, ws_mask_all = next(batch_iterator)
+        t0 = time.perf_counter()
+        sequences_all, inputs_all, targets_all, rewards_all, advantages_all, ws_all, ws_mask_all, prefix_len = next(batch_iterator)
+        t_generation += time.perf_counter() - t0
+        # Track truncated completions (generated part hit max_new_tokens without EOS)
+        for seq in sequences_all:
+            num_total_sequences += 1
+            if len(seq) - prefix_len >= args.max_new_tokens:
+                num_truncated += 1
         # Skip training if all advantages are zero (no learning signal, e.g. all rewards identical)
         if (advantages_all == 0).all():
+            num_zero_advantage += 1
             rewards_list.append(rewards_all.mean().item())
             sequence_lengths.extend(len(seq) for seq in sequences_all)
             print0(f"Step {step}/{num_steps} | Example step {example_step} | Skipped (zero advantage)")
             continue
         # Evaluate the loss and gradients
+        t0 = time.perf_counter()
         model.train()  # ensure the model is in train mode
         # We need one more loop because we can never exceed the device_batch_size
         assert inputs_all.size(0) % args.device_batch_size == 0
@@ -431,9 +447,11 @@ for step in range(num_steps):
             # Finally, formulate the loss that we want to minimize (instead of objective we wish to maximize)
             loss = -pg_obj
             loss.backward()
+            surrogate_loss_accum += loss.item()
             print0(
                 f"Step {step}/{num_steps} | Example step {example_step} | Pass {pass_idx} | loss: {loss.item():.6f} | Average reward: {rewards.mean().item()}"
             )
+        t_training += time.perf_counter() - t0
         # For logging
         rewards_list.append(rewards_all.mean().item())
         sequence_lengths.extend(len(seq) for seq in sequences_all)
@@ -461,9 +479,14 @@ for step in range(num_steps):
     wandb_run.log(
         {
             "step": step,
-            "reward": mean_reward,
-            "sequence_length": mean_sequence_length,
+            "reward/mean": mean_reward,
+            "reward/frac_zero_advantage": num_zero_advantage / examples_per_rank,
+            "train/surrogate_loss": surrogate_loss_accum,
+            "completions/clipped_ratio": num_truncated / max(num_total_sequences, 1),
+            "completions/mean_length": mean_sequence_length,
             "num_recur": logged_num_recur,
+            "time/generation": t_generation,
+            "time/training": t_training,
         }
     )
 
