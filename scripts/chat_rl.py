@@ -396,6 +396,12 @@ for step in range(num_steps):
         )
         # Get one batch corresponding to one example in the training dataset
         sequences_all, inputs_all, targets_all, rewards_all, advantages_all, ws_all, ws_mask_all = next(batch_iterator)
+        # Skip training if all advantages are zero (no learning signal, e.g. all rewards identical)
+        if (advantages_all == 0).all():
+            rewards_list.append(rewards_all.mean().item())
+            sequence_lengths.extend(len(seq) for seq in sequences_all)
+            print0(f"Step {step}/{num_steps} | Example step {example_step} | Skipped (zero advantage)")
+            continue
         # Evaluate the loss and gradients
         model.train()  # ensure the model is in train mode
         # We need one more loop because we can never exceed the device_batch_size

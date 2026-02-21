@@ -15,7 +15,7 @@ Looped Transformer specifics:
 - Three-stage architecture: prelude (n_prelude layers) → recur (n_recur_block layers, run num_recur times) → coda (n_coda layers)
 - Input injection modes (input_injection config):
   - "inject_init_prelude": u = inject(concat(e, s)) with s initially from prelude output (default looped behavior)
-  - "inject_init_random": u = inject(concat(e, s)) with s initially sampled from N(0, 1/sqrt(d))
+  - "inject_init_random": u = inject(concat(e, s)) with s initially sampled from N(0, 1)
   - "passthrough": u = s (pure recurrence, no inject layer), s initially from prelude output
   - inject layer initialized as identity-like [I|0] so inject(concat(e,s)) ≈ e initially
 - Warm-start inference: final recurrent state s from token t-1 initializes state for token t (disabled for training)
@@ -61,7 +61,7 @@ class GPTConfig:
     bptt_k: int = 4  # truncate backprop to last k recurrences
     # Input injection mode: controls how recurrent state is initialized and injected
     # - "inject_init_prelude": inject(concat(e, s)) with s initially from prelude output (default looped behavior)
-    # - "inject_init_random": inject(concat(e, s)) with s initially sampled from N(0, 1/sqrt(d))
+    # - "inject_init_random": inject(concat(e, s)) with s initially sampled from N(0, 1)
     # - "passthrough": no injection, s passes through directly (pure recurrence, s initially from prelude)
     input_injection: Literal["inject_init_prelude", "inject_init_random", "passthrough"] = "inject_init_prelude"
     logit_softcap: float = 15.0  # smoothly cap logits to [-softcap, softcap] via tanh
@@ -570,14 +570,13 @@ class GPT(nn.Module):
                 # Where mask is False, fall back to default initial state (prelude output)
                 if warm_start_mask is not None:
                     if self.config.input_injection == "inject_init_random":
-                        default_s = torch.randn_like(e) * (self.config.n_embd ** -0.5)
+                        default_s = torch.randn_like(e)
                     else:
                         default_s = e
                     s = torch.where(warm_start_mask.unsqueeze(-1), s, default_s)
             elif self.config.input_injection == "inject_init_random":
-                # Sample initial state from N(0, 1/sqrt(d)) per Geiping et al. Section 3.3
-                noise_std = self.config.n_embd ** -0.5
-                s = torch.randn_like(e) * noise_std
+                # Sample initial state from N(0, 1) to match scale of norm_recur output
+                s = torch.randn_like(e)
             else:
                 # Both "inject_init_prelude" and "passthrough" start with prelude output
                 s = e
