@@ -63,7 +63,7 @@ class GPTConfig:
     # - "inject_init_prelude": inject(concat(e, s)) with s initially from prelude output (default looped behavior)
     # - "inject_init_random": inject(concat(e, s)) with s initially sampled from N(0, 1)
     # - "passthrough": no injection, s passes through directly (pure recurrence, s initially from prelude)
-    input_injection: Literal["inject_init_prelude", "inject_init_random", "passthrough"] = "inject_init_prelude"
+    input_injection: Literal["inject_init_prelude", "inject_init_random", "passthrough"] = "inject_init_random"
     logit_softcap: float = 15.0  # smoothly cap logits to [-softcap, softcap] via tanh
 
     def __post_init__(self):

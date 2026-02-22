@@ -85,9 +85,9 @@ parser.add_argument("--bptt-k", type=int, default=4, help="truncate backprop to 
 parser.add_argument(
     "--input-injection",
     type=str,
-    default="inject_init_prelude",
+    default="inject_init_random",
     choices=["inject_init_prelude", "inject_init_random", "passthrough"],
-    help="input injection mode: inject_init_prelude (default), inject_init_random, or passthrough (no injection)",
+    help="input injection mode: inject_init_random (default), inject_init_prelude, or passthrough (no injection)",
 )
 parser.add_argument(
     "--recur-samples-per-step",

@@ -6,3 +6,4 @@ date,name,branch,size,num_recur,sample_recur,bptt_k,input_injection,flops_per_to
 2026-02-20,r4_2.15e18_s12_recur-warmup-0-6,master,S12,4,false,4,inject_init_prelude,1.444258e+09,2.15e18,1856503808,524288,32,3541,0.3,0.004,0.02,0.905568,1.84,2xNVIDIA A100-SXM4-80GB,trying warmup number of recursions
 2026-02-20,r4_2.15e18_s12_recur-warmup-0-4,master,S12,4,false,4,inject_init_prelude,1.444258e+09,2.15e18,1715470336,524288,32,3272,0.3,0.004,0.02,0.909357,1.83,2xNVIDIA A100-SXM4-80GB,trying warmup number of recursions
 2026-02-20,r4_2.15e18_s12_recur-warmup-0-2,master,S12,4,false,4,inject_init_prelude,1.444258e+09,2.15e18,1594359808,524288,32,3041,0.3,0.004,0.02,0.911514,1.81,2xNVIDIA A100-SXM4-80GB,trying warmup number of recursions
+2026-02-22,r4_2.15e18_s12_inject-random,master,S12,4,false,4,inject_init_random,1.444258e+09,2.15e18,1488453632,524288,32,2839,0.3,0.004,0.02,0.915173,1.78,2xNVIDIA A100-SXM4-80GB,inject random with std=1
