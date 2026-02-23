@@ -29,7 +29,7 @@ DEVICE_BATCH_SIZE=32
 TAG_SUFFIX=""
 # --- Less common ---
 INPUT_INJECTION=inject_init_random  # inject_init_prelude | inject_init_random | passthrough
-LOOP_STEP_EMB=false  # set to true to add learnable per-recurrence-step embedding
+LOOP_STEP_EMB=true  # set to true to add learnable per-recurrence-step embedding
 EMBEDDING_LR=0.3
 UNEMBEDDING_LR=0.004
 MATRIX_LR=0.02
