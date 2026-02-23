@@ -10,12 +10,14 @@ Two-pass training per micro-step:
           to collect final recurrent states at each position
   Pass 2: forward with shifted states as warm_start, compute loss
 
-Only assistant response positions use warm_start, simulating:
+Only assistant response positions use warm_start (via response_mask), simulating:
   - Parallel prefill for user/system tokens (no warm_start)
   - Sequential decoding for assistant responses (with warm_start)
 
-No conversation packing: one conversation per sequence row (padded).
-This wastes some compute on padding but avoids cross-conversation state leakage.
+Conversations are packed using best-fit-pad packing (multiple conversations per
+row). The response_mask naturally prevents cross-conversation state leakage: only
+assistant content tokens have mask=1, so warm_start is never applied to BOS, user,
+system, or padding tokens at conversation boundaries.
 
 Approximation note: the warm_start states come from a "cold" forward pass (pass 1
 without warm_start itself). In real autoregressive decoding, subsequent tokens would
@@ -261,21 +263,22 @@ def collect_recurrent_states(model, inputs, num_recur):
 
 
 # ---------------------------------------------------------------------------
-# Data generator: no packing, one conversation per row, returns response_mask
+# Data generator: bestfit-pad packing with response_mask for warm-start
 # ---------------------------------------------------------------------------
 
 
-def sft_latent_data_generator(split):
+def sft_latent_data_generator(split, buffer_size=100):
     """
-    Single-conversation dataloader for SFT with latent warm-start.
+    BOS-aligned packed dataloader for SFT with latent warm-start.
 
-    No packing: each row contains exactly one conversation, padded to max_seq_len.
-    Returns (inputs, targets, response_mask) where response_mask (B, T) is a bool
-    tensor indicating assistant response positions for selective warm-start.
+    Packs multiple conversations per row using best-fit algorithm (same as
+    chat_sft.py), but also tracks the response_mask from render_conversation().
+    Returns (inputs, targets, response_mask) where response_mask (B, T) is a
+    bool tensor indicating assistant response positions for selective warm-start.
 
-    The response_mask comes from tokenizer.render_conversation() which returns
-    mask=1 for assistant content tokens, and mask=0 for everything else (user,
-    system, BOS, <|assistant_start|>, tool outputs, padding).
+    The response_mask naturally prevents cross-conversation state leakage:
+    non-assistant tokens (BOS, user, system, special tokens, padding) have
+    mask=0, so warm_start is only applied to assistant content positions.
     """
     global last_step, approx_progress, current_epoch
     assert split in {"train", "val"}, "split must be 'train' or 'val'"
@@ -285,43 +288,74 @@ def sft_latent_data_generator(split):
     row_capacity = args.max_seq_len + 1  # +1 for target at last position
     bos_token = tokenizer.get_bos_token_id()
 
-    cursor = ddp_rank  # each rank starts at different conversation
+    # Conversation buffer: list of (ids, mask) tuples
+    conv_buffer: list[tuple[list[int], list[int]]] = []
+    cursor = ddp_rank  # Each rank processes different conversations
     consumed = ddp_rank
     epoch = 1
-    it = 0  # iteration counter
+    it = 0
 
-    while True:
-        batch_ids = []
-        batch_masks = []
-        batch_content_lens = []
-
-        for _ in range(args.device_batch_size):
+    def refill_buffer():
+        nonlocal cursor, epoch
+        while len(conv_buffer) < buffer_size:
             conversation = dataset[cursor]
-            ids, mask = tokenizer.render_conversation(conversation, max_tokens=row_capacity)
-            content_len = len(ids)
-
-            # Pad to row_capacity
-            pad_len = row_capacity - content_len
-            if pad_len > 0:
-                ids.extend([bos_token] * pad_len)
-                mask.extend([0] * pad_len)
-
-            batch_ids.append(ids[:row_capacity])
-            batch_masks.append(mask[:row_capacity])
-            batch_content_lens.append(min(content_len, row_capacity))
-
+            ids, mask = tokenizer.render_conversation(conversation)
+            conv_buffer.append((ids, mask))
             cursor += ddp_world_size
-            consumed += ddp_world_size
             if cursor >= dataset_size:
                 cursor = cursor % dataset_size
                 epoch += 1
 
-        # Stopping condition to respect num_iterations, if given
+    while True:
+        rows_ids = []
+        rows_masks = []
+        row_lengths = []
+
+        for _ in range(args.device_batch_size):
+            row_ids: list[int] = []
+            row_mask: list[int] = []
+            padded = False
+
+            while len(row_ids) < row_capacity:
+                while len(conv_buffer) < buffer_size:
+                    refill_buffer()
+
+                remaining = row_capacity - len(row_ids)
+
+                # Find largest conversation that fits entirely
+                best_idx = -1
+                best_len = 0
+                for i, (conv_ids, _) in enumerate(conv_buffer):
+                    conv_len = len(conv_ids)
+                    if conv_len <= remaining and conv_len > best_len:
+                        best_idx = i
+                        best_len = conv_len
+
+                if best_idx >= 0:
+                    conv_ids, conv_mask = conv_buffer.pop(best_idx)
+                    row_ids.extend(conv_ids)
+                    row_mask.extend(conv_mask)
+                    consumed += ddp_world_size
+                else:
+                    # No conversation fits - pad the remainder
+                    content_len = len(row_ids)
+                    row_ids.extend([bos_token] * remaining)
+                    row_mask.extend([0] * remaining)
+                    padded = True
+                    break
+
+            if padded:
+                row_lengths.append(content_len)
+            else:
+                row_lengths.append(row_capacity)
+            rows_ids.append(row_ids[:row_capacity])
+            rows_masks.append(row_mask[:row_capacity])
+
+        # Stopping condition
         it += 1
         if 0 < args.num_iterations <= it and split == "train":
             last_step = True
 
-        # Update progress tracking
         if split == "train":
             current_epoch = epoch
             if args.num_iterations > 0:
@@ -333,8 +367,8 @@ def sft_latent_data_generator(split):
 
         # Build tensors
         use_cuda = device_type == "cuda"
-        batch_tensor = torch.tensor(batch_ids, dtype=torch.long, pin_memory=use_cuda)
-        mask_tensor = torch.tensor(batch_masks, dtype=torch.long, pin_memory=use_cuda)
+        batch_tensor = torch.tensor(rows_ids, dtype=torch.long, pin_memory=use_cuda)
+        mask_tensor = torch.tensor(rows_masks, dtype=torch.long, pin_memory=use_cuda)
         inputs = batch_tensor[:, :-1].to(device=device, dtype=torch.int32, non_blocking=use_cuda)
         targets = batch_tensor[:, 1:].to(device=device, dtype=torch.int64, non_blocking=use_cuda)
 
@@ -343,7 +377,7 @@ def sft_latent_data_generator(split):
         response_mask = mask_tensor[:, :-1].to(device=device, dtype=torch.bool, non_blocking=use_cuda)
 
         # Mask out padding positions in targets (set to -1 = ignore_index)
-        for i, content_len in enumerate(batch_content_lens):
+        for i, content_len in enumerate(row_lengths):
             if content_len < row_capacity:
                 targets[i, content_len - 1 :] = -1
 
