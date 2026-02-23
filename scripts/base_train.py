@@ -95,6 +95,12 @@ parser.add_argument(
     default=8,
     help="Number of different num_recur values per gradient accumulation step (0 = fixed, use model default)",
 )
+parser.add_argument(
+    "--loop-step-emb",
+    action="store_true",
+    default=False,
+    help="Add learnable per-recurrence-step embedding to recur block input",
+)
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -221,6 +227,7 @@ model_config_kwargs = {
     "train_recur_max": args.train_recur_max,
     "bptt_k": args.bptt_k,
     "input_injection": args.input_injection,
+    "loop_step_emb": args.loop_step_emb,
 }
 with torch.device("meta"):
     # All tensors are created as meta tensors (they have shape/dtype but no data)

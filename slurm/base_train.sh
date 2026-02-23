@@ -28,7 +28,8 @@ RECUR_WARMUP_RATIO=0.0  # -1 = auto (1 - warmdown_ratio), 0 = disabled
 DEVICE_BATCH_SIZE=32
 TAG_SUFFIX=""
 # --- Less common ---
-INPUT_INJECTION=inject_init_prelude  # inject_init_prelude | inject_init_random | passthrough
+INPUT_INJECTION=inject_init_random  # inject_init_prelude | inject_init_random | passthrough
+LOOP_STEP_EMB=false  # set to true to add learnable per-recurrence-step embedding
 EMBEDDING_LR=0.3
 UNEMBEDDING_LR=0.004
 MATRIX_LR=0.02
@@ -40,6 +41,12 @@ if [ "$SAMPLE_R" = true ]; then
 else
     RECUR_SAMPLES_PER_STEP=0
     TAG="r${NUM_RECUR}_${TARGET_FLOPS}_s${SIZE}${TAG_SUFFIX}"
+fi
+if [ "$LOOP_STEP_EMB" = true ]; then
+    TAG="${TAG}_stepemb"
+    LOOP_STEP_EMB_FLAG="--loop-step-emb"
+else
+    LOOP_STEP_EMB_FLAG=""
 fi
 RUN=$TAG
 
@@ -63,6 +70,7 @@ torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train \
     --unembedding-lr=$UNEMBEDDING_LR \
     --matrix-lr=$MATRIX_LR \
     --save-every=-1 \
+    $LOOP_STEP_EMB_FLAG \
     --size $SIZE 2>&1 | tee "$TRAIN_LOG"
 TRAIN_EXIT=${PIPESTATUS[0]}
 

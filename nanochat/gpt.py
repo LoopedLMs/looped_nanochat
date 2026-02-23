@@ -64,6 +64,7 @@ class GPTConfig:
     # - "inject_init_random": inject(concat(e, s)) with s initially sampled from N(0, 1)
     # - "passthrough": no injection, s passes through directly (pure recurrence, s initially from prelude)
     input_injection: Literal["inject_init_prelude", "inject_init_random", "passthrough"] = "inject_init_random"
+    loop_step_emb: bool = False  # add learnable per-recurrence-step embedding to recur input
     logit_softcap: float = 15.0  # smoothly cap logits to [-softcap, softcap] via tanh
 
     def __post_init__(self):
@@ -213,6 +214,9 @@ class GPT(nn.Module):
         # Input injection adapter (only needed when not using passthrough mode)
         if config.input_injection != "passthrough":
             self.inject = nn.Linear(2 * config.n_embd, config.n_embd, bias=False)
+        # Learnable per-recurrence-step embedding (tells the model which loop iteration it's on)
+        if config.loop_step_emb:
+            self.loop_step_emb = nn.Embedding(config.train_recur_max, config.n_embd)
         # RMSNorm layers outside blocks
         self.norm_emb = RMSNorm(config.n_embd)  # after embedding
         self.norm_recur = RMSNorm(config.n_embd)  # at end of recurrent block (nc)
@@ -267,6 +271,10 @@ class GPT(nn.Module):
             with torch.no_grad():
                 self.inject.weight.zero_()
                 self.inject.weight[:, :n_embd].copy_(torch.eye(n_embd))
+
+        # Loop step embeddings: zero-init so model starts without step information
+        if self.config.loop_step_emb:
+            torch.nn.init.zeros_(self.loop_step_emb.weight)
 
         # RMSNorm weights: initialize to ones
         for module in self.modules():
@@ -489,6 +497,7 @@ class GPT(nn.Module):
         recur_block = sum(p.numel() for p in self.transformer.recur.parameters())
         coda = sum(p.numel() for p in self.transformer.coda.parameters())
         inject = sum(p.numel() for p in self.inject.parameters()) if self.config.input_injection != "passthrough" else 0
+        loop_step = sum(p.numel() for p in self.loop_step_emb.parameters()) if self.config.loop_step_emb else 0
 
         # Scalars: RMSNorm scale parameters
         scalars = (
@@ -497,7 +506,7 @@ class GPT(nn.Module):
             + sum(p.numel() for p in self.norm_final.parameters())
         )
 
-        total = wte + value_embeds + lm_head + prelude + recur_block + coda + inject + scalars
+        total = wte + value_embeds + lm_head + prelude + recur_block + coda + inject + loop_step + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
 
         return {
@@ -508,6 +517,7 @@ class GPT(nn.Module):
             'recur_block': recur_block,
             'coda': coda,
             'inject': inject,
+            'loop_step': loop_step,
             'scalars': scalars,
             'total': total,
         }
@@ -624,8 +634,9 @@ class GPT(nn.Module):
             if p not in norm_param_set
         ]
         embedding_params = list(self.transformer.wte.parameters())
+        loop_step_params = list(self.loop_step_emb.parameters()) if self.config.loop_step_emb else []
         lm_head_params = list(self.lm_head.parameters())
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(norm_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(loop_step_params) + len(lm_head_params) + len(norm_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -638,6 +649,10 @@ class GPT(nn.Module):
             dict(kind="adamw", params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind="adamw", params=norm_params, lr=0.005 * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
         ]
+        if loop_step_params:
+            param_groups.append(
+                dict(kind="adamw", params=loop_step_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            )
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -751,6 +766,9 @@ class GPT(nn.Module):
         for i in range(num_recur):
             # State transfer: handles initialization (on i==0) and input injection
             u = self._state_transfer(e, s=s, warm_start_state=warm_start_state, warm_start_mask=warm_start_mask)
+            # Add loop step embedding (tells model which recurrence iteration this is)
+            if self.config.loop_step_emb:
+                u = u + self.loop_step_emb.weight[i]  # (n_embd,) broadcasts over (B, T, n_embd)
             # Run recur blocks with KV cache
             for j, block in enumerate(self.transformer.recur):
                 layer_idx = self._get_kv_layer_idx("recur", j, kv_budget, recur_iter=i)
