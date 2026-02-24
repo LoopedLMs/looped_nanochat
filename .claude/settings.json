@@ -6,6 +6,11 @@
       "Read(./config/credentials.json)",
       "Read(~/.ssh/**)",
       "Read(~/.aws/**)"
+    ],
+    "allow": [
+      "Bash(ls:*)",
+      "Bash(find:*)",
+      "Bash(grep:*)"
     ]
   }
 }

@@ -385,6 +385,7 @@ for step in range(num_steps):
     # Forward/Backward on rollouts over multiple examples in the dataset
     rewards_list = []
     sequence_lengths = []
+    had_backward = False  # track whether any backward pass was performed this step
     num_zero_advantage = 0  # count questions where all advantages are zero (no learning signal)
     num_truncated = 0  # count sequences that hit max_new_tokens without EOS
     num_total_sequences = 0
@@ -447,6 +448,7 @@ for step in range(num_steps):
             # Finally, formulate the loss that we want to minimize (instead of objective we wish to maximize)
             loss = -pg_obj
             loss.backward()
+            had_backward = True
             surrogate_loss_accum += loss.item()
             print0(
                 f"Step {step}/{num_steps} | Example step {example_step} | Pass {pass_idx} | loss: {loss.item():.6f} | Average reward: {rewards.mean().item()}"
@@ -490,20 +492,34 @@ for step in range(num_steps):
         }
     )
 
-    # Compute model health statistics: gradients and parameters (after all backward passes complete)
-    model_health_stats = compute_gradient_stats(model, args.track_gradients)
-
-    # Update the model parameters
+    # Update the model parameters (skip only if NO rank had a backward pass)
     lrm = get_lr_multiplier(step)
-    for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
-    optimizer.step()
-    model.zero_grad(set_to_none=True)
+    if ddp:
+        # All ranks must agree: if any rank had a backward, all must participate in the optimizer step
+        had_backward_tensor = torch.tensor(float(had_backward), device=device)
+        dist.all_reduce(had_backward_tensor, op=dist.ReduceOp.MAX)
+        any_rank_had_backward = had_backward_tensor.item() > 0
+        # Ranks that didn't run backward still need valid (zero) grads for the collective ops
+        if any_rank_had_backward and not had_backward:
+            for p in model.parameters():
+                if p.requires_grad and p.grad is None:
+                    p.grad = torch.zeros_like(p)
+    else:
+        any_rank_had_backward = had_backward
+    if any_rank_had_backward:
+        model_health_stats = compute_gradient_stats(model, args.track_gradients)
+        for group in optimizer.param_groups:
+            group["lr"] = group["initial_lr"] * lrm
+        optimizer.step()
+        model.zero_grad(set_to_none=True)
+    else:
+        model_health_stats = {}
+        print0(f"Step {step}/{num_steps} | Skipping optimizer step (no gradients on any rank)")
     wandb_run.log(
         {
             "step": step,
             "lrm": lrm,
-            **{f"model_health/{k}": v for k, v in model_health_stats.items()},  # Add model health stats
+            **{f"model_health/{k}": v for k, v in model_health_stats.items()},
         }
     )
 
