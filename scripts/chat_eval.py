@@ -310,7 +310,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Parse num_recur argument - can be single value or comma-separated list
-    recur_values = [None]  # default: use model's default
+    # None is resolved to the model's default after loading
+    recur_values = [None]
     if args.num_recur is not None:
         recur_values = [int(x.strip()) for x in args.num_recur.split(",")]
 
@@ -341,6 +342,9 @@ if __name__ == "__main__":
     model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
     engine = Engine(model, tokenizer)
 
+    # Resolve None num_recur to the model's default
+    recur_values = [int(model.config.train_recur_mean) if v is None else v for v in recur_values]
+
     # Get the tasks to evaluate on
     all_tasks = ["ARC-Easy", "ARC-Challenge", "MMLU", "GSM8K", "HumanEval", "SpellingBee"]
     baseline_accuracies = {
@@ -361,7 +365,7 @@ if __name__ == "__main__":
     summary_csv_path = os.path.join(eval_dir, f"{base_slug}.csv")
 
     def read_completed_rows(csv_path: str) -> set[str]:
-        """Read CSV and return set of 'num_recur,kv_budget' keys already present."""
+        """Read CSV and return set of 'num_recur,kv_budget,warm_start' keys already present."""
         if not os.path.exists(csv_path):
             return set()
         completed = set()
@@ -369,9 +373,9 @@ if __name__ == "__main__":
             for line in f:
                 if line.startswith("#") or line.startswith("num_recur"):
                     continue
-                parts = line.split(",", 2)
-                if len(parts) >= 2:
-                    completed.add(f"{parts[0].strip()},{parts[1].strip()}")
+                parts = line.split(",", 3)
+                if len(parts) >= 3:
+                    completed.add(f"{parts[0].strip()},{parts[1].strip()},{parts[2].strip()}")
         return completed
 
     completed_rows = read_completed_rows(summary_csv_path)
@@ -385,10 +389,11 @@ if __name__ == "__main__":
                     f", warm_start={args.use_rec_warm_start}, dtype={args.dtype}"
                     f", tasks={';'.join(task_names)}\n")
 
+    warm_start = args.use_rec_warm_start
     for num_recur, kv_budget in zip(recur_values, kv_budgets):
-        row_key = f"{num_recur},{kv_budget}"
+        row_key = f"{num_recur},{kv_budget},{warm_start}"
         if row_key in completed_rows:
-            print0(f"\nSkipping num_recur={num_recur}, kv_budget={kv_budget} (already in CSV)")
+            print0(f"\nSkipping num_recur={num_recur}, kv_budget={kv_budget}, warm_start={warm_start} (already in CSV)")
             continue
 
         print0(f"\n{'=' * 80}")
@@ -432,8 +437,8 @@ if __name__ == "__main__":
 
         # Append summary row to CSV
         if ddp_rank == 0:
-            columns = ["num_recur", "kv_budget"]
-            values = [str(num_recur), str(kv_budget)]
+            columns = ["num_recur", "kv_budget", "warm_start"]
+            values = [str(num_recur), str(kv_budget), str(warm_start)]
             for task in task_names:
                 columns.append(task)
                 values.append(f"{results.get(task, 0.0):.6f}")

@@ -11,8 +11,9 @@ validate_config || exit 1
 NPROC_PER_NODE=${SLURM_GPUS:-1}
 
 # --- Experiment config ---
-SFT_MODEL=r4_1.35e19_s20           # SFT checkpoint tag to continue from
-OUTPUT_TAG=r4_1.35e19_s20           # output tag (defaults to SFT_MODEL if empty)
+INIT_SOURCE=base                     # checkpoint source: base, sft, sft_latent, rl
+MODEL_TAG=r4_1.35e19_s20            # checkpoint tag to load from
+OUTPUT_TAG=r4_1.35e19_s20_warmup           # output tag (defaults to MODEL_TAG if empty)
 DEVICE_BATCH_SIZE=8
 RECUR_SAMPLES_PER_STEP=0            # 0 = fixed recurrence, >0 = sample per step
 NO_DETACH_WARMUP=0                  # 0 = detach warm_start states (default), 1 = keep gradients
@@ -20,7 +21,7 @@ NO_DETACH_WARMUP=0                  # 0 = detach warm_start states (default), 1 
 EMBEDDING_LR=0.2
 UNEMBEDDING_LR=0.004
 MATRIX_LR=0.02
-INIT_LR_FRAC=0.5
+INIT_LR_FRAC=1.0
 
 # --- Eval config ---
 EVAL_TASKS=""                       # empty = all tasks
@@ -30,11 +31,11 @@ EVAL_GEN_BATCH_SIZE=16              # generative eval batch size
 SKIP_EVAL=0                         # set to 1 to skip chat eval after training
 
 # --- Derived config ---
-OUTPUT_TAG=${OUTPUT_TAG:-$SFT_MODEL}
+OUTPUT_TAG=${OUTPUT_TAG:-$MODEL_TAG}
 RUN=$OUTPUT_TAG
 
 # Build training args
-TRAIN_ARGS="--model-tag $SFT_MODEL --output-tag $OUTPUT_TAG \
+TRAIN_ARGS="--init-source $INIT_SOURCE --model-tag $MODEL_TAG --output-tag $OUTPUT_TAG \
     --device-batch-size $DEVICE_BATCH_SIZE \
     --run $RUN \
     --recur-samples-per-step $RECUR_SAMPLES_PER_STEP \
@@ -62,7 +63,7 @@ if [ "$SKIP_EVAL" -eq 1 ]; then
 fi
 
 # Run chat eval
-EVAL_ARGS="-i sft_latent -g $OUTPUT_TAG --batch-size $EVAL_BATCH_SIZE --gen-batch-size $EVAL_GEN_BATCH_SIZE"
+EVAL_ARGS="-i sft_latent -g $OUTPUT_TAG --batch-size $EVAL_BATCH_SIZE --gen-batch-size $EVAL_GEN_BATCH_SIZE --use-rec-warm-start --kv-budget -1"
 if [ -n "$EVAL_TASKS" ]; then
     EVAL_ARGS="$EVAL_ARGS --task-name $EVAL_TASKS"
 fi

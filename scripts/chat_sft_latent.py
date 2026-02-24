@@ -75,6 +75,8 @@ parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('d
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 parser.add_argument("--dtype", type=str, default="bfloat16", help="float32|bfloat16")
 # Model loading
+parser.add_argument("--init-source", type=str, default="sft", choices=["base", "sft", "sft_latent", "rl"],
+                    help="checkpoint source to initialize from (default: sft)")
 parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
 parser.add_argument("--output-tag", type=str, default=None, help="model tag to save to (defaults to model-tag)")
@@ -137,10 +139,10 @@ get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else l
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sft-latent", name=args.run, config=user_config)
+wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sft", name=args.run, config=user_config)
 
-# Load model from SFT checkpoint (continuing from SFT, not base)
-model, tokenizer, meta = load_model("sft", device, phase="train", model_tag=args.model_tag, step=args.model_step)
+# Load model checkpoint
+model, tokenizer, meta = load_model(args.init_source, device, phase="train", model_tag=args.model_tag, step=args.model_step)
 # Always compile blocks individually (never whole model) because the two-pass
 # approach calls the model with different forward signatures per micro-step:
 # pass 1 uses collect_recurrent_states (no lm_head), pass 2 returns loss.
