@@ -34,7 +34,7 @@ if [ $# -eq 0 ]; then
     done
     echo ""
 
-    # Show configured paths if machine_config.sh exists
+    # Show configured paths if _machine_config.sh exists
     if [ -f "shells/_machine_config.sh" ]; then
         source "shells/_machine_config.sh"
         echo "Configured paths (from _machine_config.sh):"

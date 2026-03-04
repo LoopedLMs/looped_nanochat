@@ -6,8 +6,8 @@ This directory contains SLURM job scripts for running experiments on the cluster
 
 1. **First-time setup** - Create your machine-specific config:
    ```bash
-   cp shells/machine_config.sh.template shells/machine_config.sh
-   # Edit machine_config.sh with your cluster settings
+   cp shells/_machine_config.sh.template shells/_machine_config.sh
+   # Edit _machine_config.sh with your cluster settings
    ```
 
 2. **Submit a job**:
@@ -23,21 +23,21 @@ This directory contains SLURM job scripts for running experiments on the cluster
 
 ## Architecture
 
-### Configuration (`machine_config.sh`)
+### Configuration (`_machine_config.sh`)
 - **Gitignored** - each user/machine has their own config
 - Sets environment variables (HF_HOME, NANOCHAT_BASE_DIR, etc.)
 - Defines SLURM defaults (partition, QoS, memory, GPUs, email)
-- See [machine_config.sh.template](machine_config.sh.template) for all options
+- See [_machine_config.sh.template](_machine_config.sh.template) for all options
 
 ### Job Scripts (`*.sh`)
 - **Tracked in git** - contains the job logic only
 - No SLURM headers - pure bash scripts
 - Can be run locally or via SLURM
-- Sources `machine_config.sh` for environment setup
+- Sources `_machine_config.sh` for environment setup
 - **Naming convention**: Scripts ending with `_cpu.sh` are submitted as CPU jobs; all others as GPU jobs
 
 ### Submission Wrapper (`submit.sh`)
-- Reads your `machine_config.sh`
+- Reads your `_machine_config.sh`
 - Auto-detects job type (CPU vs GPU)
 - Generates appropriate SLURM headers
 - Submits job with `sbatch`
