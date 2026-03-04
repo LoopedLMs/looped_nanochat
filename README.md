@@ -103,7 +103,7 @@ For questions about the repo, I recommend either using [DeepWiki](https://deepwi
 │   ├── chat_web.py                 # Chat model: talk to over WebUI
 │   ├── tok_eval.py                 # Tokenizer: evaluate compression rate
 │   └── tok_train.py                # Tokenizer: train it
-├── slurm
+├── shells
 │   ├── chat_eval.sbatch            # SLURM job: chat evaluation
 │   ├── chat_rl.sbatch              # SLURM job: reinforcement learning
 │   ├── chat_sft.sbatch             # SLURM job: supervised fine-tuning

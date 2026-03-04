@@ -15,5 +15,5 @@ logs/
 knowledge/
 
 # Machine-specific config
-slurm/machine_config.sh
-slurm/rsync_weights.sh
+shells/_machine_config*.sh
+shells/rsync_weights.sh

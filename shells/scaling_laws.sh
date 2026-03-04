@@ -25,7 +25,7 @@ export OMP_NUM_THREADS=1 # disable CPU multi-threading for libraries that use Op
 
 cd ~/looped_nanochat
 
-source slurm/machine_config.sh
+source shells/machine_config.sh
 validate_config || exit 1
 
 uv sync

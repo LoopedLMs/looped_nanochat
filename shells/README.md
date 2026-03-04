@@ -6,19 +6,19 @@ This directory contains SLURM job scripts for running experiments on the cluster
 
 1. **First-time setup** - Create your machine-specific config:
    ```bash
-   cp slurm/machine_config.sh.template slurm/machine_config.sh
+   cp shells/machine_config.sh.template shells/machine_config.sh
    # Edit machine_config.sh with your cluster settings
    ```
 
 2. **Submit a job**:
    ```bash
-   ./slurm/submit.sh slurm/chat_sft.sh
+   ./shells/submit.sh shells/chat_sft.sh
    ```
 
 3. **Override SLURM parameters** (optional):
    ```bash
-   ./slurm/submit.sh slurm/scaling_laws.sh --time=24:00:00
-   ./slurm/submit.sh slurm/chat_eval.sh --mem=128G
+   ./shells/submit.sh shells/scaling_laws.sh --time=24:00:00
+   ./shells/submit.sh shells/chat_eval.sh --mem=128G
    ```
 
 ## Architecture

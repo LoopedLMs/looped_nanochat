@@ -4,7 +4,7 @@ cd ~/looped_nanochat
 uv sync
 source .venv/bin/activate
 
-source slurm/machine_config.sh
+source shells/machine_config.sh
 validate_config || exit 1
 
 python -m nanochat.dataset -n 700

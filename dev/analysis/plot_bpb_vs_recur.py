@@ -24,7 +24,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 # Source machine_config.sh so NANOCHAT_BASE_DIR is set before get_base_dir()
-_config_path = Path(__file__).resolve().parents[2] / "slurm" / "machine_config.sh"
+_config_path = Path(__file__).resolve().parents[2] / "shells" / "machine_config.sh"
 if _config_path.exists() and not os.environ.get("NANOCHAT_BASE_DIR"):
     _out = subprocess.run(
         ["bash", "-c", f"source {_config_path} && env"],
