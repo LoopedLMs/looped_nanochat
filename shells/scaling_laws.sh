@@ -17,7 +17,7 @@ N_RECUR_BLOCK=4
 N_CODA=2
 N_RECUR=4
 
-NPROC_PER_NODE=${SLURM_GPUS:-1} # Number of processes/GPUs to use (from machine_config.sh, defaults to 1)
+NPROC_PER_NODE=${NUM_GPUS:-1} # Number of processes/GPUs to use (from machine_config.sh, defaults to 1)
 WANDB_RUN="${WANDB_RUN:-scaling_${LABEL}}"
 EVAL_TOKENS=$((100 * 524288))  # ~100M tokens for final eval (default is ~10M)
 

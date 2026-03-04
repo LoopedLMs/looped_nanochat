@@ -8,7 +8,7 @@ source shells/machine_config.sh
 validate_config || exit 1
 
 # Number of processes/GPUs to use (from machine_config.sh, defaults to 1)
-NPROC_PER_NODE=${SLURM_GPUS:-1}
+NPROC_PER_NODE=${NUM_GPUS:-1}
 
 # --- Experiment config ---
 BASE_MODEL=r4_1.35e19_s20        # base model tag to finetune from
