@@ -99,7 +99,15 @@ for flops in "${FLOPS_BUDGETS[@]}"; do
             --n-recur-block=$N_RECUR_BLOCK \
             --n-coda=$N_CODA \
             --input-injection=inject_init_prelude \
-            --no-sample-recur \
+            --recur-samples-per-step=0 \
+            --bptt-k=$N_RECUR \
+            --recur-warmup-ratio=0 \
+            --embedding-lr=0.3 \
+            --unembedding-lr=0.004 \
+            --matrix-lr=0.02 \
+            --warmup-ratio=0.0 \
+            --warmdown-ratio=0.4 \
+            --final-lr-frac=0.0 \
             2>&1 | tee "$RESULTS_DIR/${TAG}_train.log"
 
         END_TIME=$(date +%s)
