@@ -701,7 +701,11 @@ class GPT(nn.Module):
         warm_start_mask=None,
         return_intermediate_logits: bool = False,
         return_intermediate_states: bool = False,
+        kv_restart: bool = False,
     ):
+        # Allow setting model.kv_restart = True externally so eval scripts that don't
+        # thread the kwarg through intermediate helpers still pick it up.
+        kv_restart = kv_restart or getattr(self, "kv_restart", False)
         B, T = idx.size()
         if num_recur is None:
             num_recur = int(self.config.train_recur_mean)
@@ -765,6 +769,25 @@ class GPT(nn.Module):
                 intermediate_states.append(s)
             if return_intermediate_logits:
                 intermediate_logits.append(self._predict(s, cos_sin, kv_cache, kv_budget))
+
+        # KV-Cache Restart: run a second unroll from a clean initial state, injecting the
+        # final hidden state of pass 1 as additive guidance at every recurrence step.
+        # Conceptually each recurrence step in pass 2 "attends" to the final KV of pass 1
+        # by having its Q/K/V projections computed from (u + s_guidance) instead of u alone.
+        # Only supported for full-sequence forward (kv_cache=None); decode mode is skipped.
+        if kv_restart and kv_cache is None:
+            s_guidance = s.detach()  # (B, T, n_embd) – final state from pass 1
+            s = None  # fresh start: re-initialise recurrence state
+            for i in range(num_recur):
+                # Clean initial state (no warm_start), then inject guidance
+                u = self._state_transfer(e, s=s)
+                u = u + s_guidance  # additive guidance: shifts Q/K/V toward pass-1 final KV
+                for j, block in enumerate(self.transformer.recur):
+                    layer_idx = self._get_kv_layer_idx("recur", j, kv_budget, recur_iter=i)
+                    u = block(u, cos_sin, self.window_sizes[self.config.n_prelude + j], kv_cache, layer_idx)
+                s = self.norm_recur(u)
+                if self.config.bptt_k is not None and i < num_recur - self.config.bptt_k:
+                    s = s.detach()
 
         # 5. Coda + norm_final + lm_head → logits (final prediction)
         # When collecting intermediate logits, the last entry is already the final prediction

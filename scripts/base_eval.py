@@ -192,6 +192,7 @@ def main():
     parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
     parser.add_argument("--num-recur", type=str, default=None, help="Comma-separated recurrence depths to evaluate, e.g. '2,4,6' (default = model's train_recur_mean)")
     parser.add_argument("--debug", type=int, default=0, help="Print this many debug examples per arithmetic task (0 = off)")
+    parser.add_argument("--kv-restart", action="store_true", help="Enable KV-cache restart: run a second unroll from a clean state guided by the first unroll's final hidden state")
     args = parser.parse_args()
 
     # Parse evaluation modes
@@ -216,6 +217,11 @@ def main():
         model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=args.model_tag, step=args.step)
         sequence_len = meta["model_config"]["sequence_len"]
         token_bytes = get_token_bytes(device=device)
+
+    # KV-restart: set as model attribute so all downstream call sites pick it up
+    if args.kv_restart and not is_hf_model:
+        model.kv_restart = True
+        print0("KV-restart enabled: each forward pass runs two recurrent unrolls")
 
     # Parse num_recur into a list of values to sweep
     if args.num_recur is not None:

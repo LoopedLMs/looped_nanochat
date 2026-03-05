@@ -307,6 +307,7 @@ if __name__ == "__main__":
     parser.add_argument('-r', '--num-recur', type=str, default=None, help='Number of recurrences for recursive transformer (optional, uses model default if not specified)')
     parser.add_argument('-rws', '--use-rec-warm-start', action='store_true', help='Use recurrent warm-start (carry recurrent state when decoding tokens)')
     parser.add_argument('-kb', '--kv-budget', type=str, default='1', help='KV-cache budget for recurrences. Single value broadcasts to all num-recur. Comma-separated list must match num-recur length. -1 means "same as num-recur" (cache all iterations). Default=1')
+    parser.add_argument('--kv-restart', action='store_true', help='Enable KV-cache restart: run a second unroll from a clean state guided by the first unroll\'s final hidden state (full-sequence evals only; generative/decode path is unaffected)')
     args = parser.parse_args()
 
     # Parse num_recur argument - can be single value or comma-separated list
@@ -340,6 +341,11 @@ if __name__ == "__main__":
 
     model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
     engine = Engine(model, tokenizer)
+
+    # KV-restart: set as model attribute so categorical eval picks it up automatically
+    if args.kv_restart:
+        model.kv_restart = True
+        print0("KV-restart enabled: each forward pass runs two recurrent unrolls")
 
     # Get the tasks to evaluate on
     all_tasks = ["ARC-Easy", "ARC-Challenge", "MMLU", "GSM8K", "HumanEval", "SpellingBee"]
