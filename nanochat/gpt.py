@@ -112,16 +112,20 @@ class CausalSelfAttention(nn.Module):
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
 
-    def forward(self, x, cos_sin, window_size, kv_cache, layer_idx=None):
+    def forward(self, x, cos_sin, window_size, kv_cache, layer_idx=None, kv_src=None):
         B, T, C = x.size()
         # Fail fast: layer_idx required when using kv_cache
         assert (kv_cache is None) or (layer_idx is not None), "layer_idx required when kv_cache is provided"
 
         # Project the input to get queries, keys, and values
         # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
+        # kv_src: when provided (KV-restart pass 2), Q comes from x (fresh hidden state)
+        # but K/V come from kv_src (pass 1's saved normalised block input) so attention
+        # attends to the fixed KV of the last unroll rather than recomputing it.
+        kv_input = kv_src if kv_src is not None else x
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        k = self.c_k(kv_input).view(B, T, self.n_kv_head, self.head_dim)
+        v = self.c_v(kv_input).view(B, T, self.n_kv_head, self.head_dim)
 
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
         cos, sin = cos_sin
@@ -177,9 +181,11 @@ class Block(nn.Module):
         self.n3 = RMSNorm(config.n_embd)
         self.n4 = RMSNorm(config.n_embd)
 
-    def forward(self, x, cos_sin, window_size, kv_cache, layer_idx=None):
+    def forward(self, x, cos_sin, window_size, kv_cache, layer_idx=None, kv_src=None):
         # Sandwich norm format: x̂=n2(x+Attn(n1(x))), x=n4(x̂+MLP(n3(x̂)))
-        x = self.n2(x + self.attn(self.n1(x), cos_sin, window_size, kv_cache, layer_idx))
+        # kv_src: if set, attention K/V are derived from n1(kv_src) instead of n1(x).
+        attn_kv_src = self.n1(kv_src) if kv_src is not None else None
+        x = self.n2(x + self.attn(self.n1(x), cos_sin, window_size, kv_cache, layer_idx, kv_src=attn_kv_src))
         x = self.n4(x + self.mlp(self.n3(x)))
         return x
 
@@ -752,11 +758,22 @@ class GPT(nn.Module):
         intermediate_states = [] if return_intermediate_states else None
 
         # 4. Recurrent block (run num_recur times)
+        # When kv_restart is active we also capture the normalised attention input for each
+        # block in the FINAL recurrence step.  These are the tensors whose K/V projections
+        # produced the "last-round KV" we want to reuse in pass 2.
+        kv_restart_captures: list[torch.Tensor] | None = None  # set below on final step
+
         for i in range(num_recur):
             # State transfer: handles initialization (on i==0) and input injection
             u = self._state_transfer(e, s=s, warm_start_state=warm_start_state, warm_start_mask=warm_start_mask)
             # Run recur blocks with KV cache
+            is_final_recur = kv_restart and (i == num_recur - 1) and kv_cache is None
+            if is_final_recur:
+                kv_restart_captures = []
             for j, block in enumerate(self.transformer.recur):
+                if is_final_recur:
+                    # Save the block input (pre-n1) so pass 2 can reuse its K/V projections
+                    kv_restart_captures.append(u.detach())
                 layer_idx = self._get_kv_layer_idx("recur", j, kv_budget, recur_iter=i)
                 u = block(u, cos_sin, self.window_sizes[self.config.n_prelude + j], kv_cache, layer_idx)
             s = self.norm_recur(u)  # nc: rescale at end of recurrent block
@@ -770,21 +787,22 @@ class GPT(nn.Module):
             if return_intermediate_logits:
                 intermediate_logits.append(self._predict(s, cos_sin, kv_cache, kv_budget))
 
-        # KV-Cache Restart: run a second unroll from a clean initial state, injecting the
-        # final hidden state of pass 1 as additive guidance at every recurrence step.
-        # Conceptually each recurrence step in pass 2 "attends" to the final KV of pass 1
-        # by having its Q/K/V projections computed from (u + s_guidance) instead of u alone.
-        # Only supported for full-sequence forward (kv_cache=None); decode mode is skipped.
+        # KV-Cache Restart (pass 2): start from a clean initial state but at every
+        # recurrence step attend to the FIXED K/V from pass 1's final unroll.
+        # Each block j computes Q from the fresh pass-2 hidden state and K/V from the
+        # saved pre-norm input captured above (kv_restart_captures[j]).  This is true
+        # cross-attention to "last-round KV" — no architecture change, no new parameters.
+        # Only runs for full-sequence forward (kv_cache=None); decode mode unaffected.
         if kv_restart and kv_cache is None:
-            s_guidance = s.detach()  # (B, T, n_embd) – final state from pass 1
-            s = None  # fresh start: re-initialise recurrence state
+            s = None  # clean initial state
             for i in range(num_recur):
-                # Clean initial state (no warm_start), then inject guidance
                 u = self._state_transfer(e, s=s)
-                u = u + s_guidance  # additive guidance: shifts Q/K/V toward pass-1 final KV
                 for j, block in enumerate(self.transformer.recur):
                     layer_idx = self._get_kv_layer_idx("recur", j, kv_budget, recur_iter=i)
-                    u = block(u, cos_sin, self.window_sizes[self.config.n_prelude + j], kv_cache, layer_idx)
+                    u = block(
+                        u, cos_sin, self.window_sizes[self.config.n_prelude + j], kv_cache, layer_idx,
+                        kv_src=kv_restart_captures[j],  # Q fresh, K/V fixed from pass 1
+                    )
                 s = self.norm_recur(u)
                 if self.config.bptt_k is not None and i < num_recur - self.config.bptt_k:
                     s = s.detach()
