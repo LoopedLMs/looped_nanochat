@@ -27,3 +27,6 @@ Check `.venv` source code directly for library implementation details
 
 ## Project Paths
 `NANOCHAT_BASE_DIR` (results, checkpoints, plots) is configured in `shells/machine_config.sh`.
+
+## External Knowledge (Notion)
+Paper summaries are synced to a Notion database. The project page ID is in `./notion.txt`. When the user references a paper or asks about related work, check Notion first using `notion-search` before re-reading local files or re-downloading.

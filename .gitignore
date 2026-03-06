@@ -8,6 +8,7 @@ eval_bundle/
 
 # Secrets
 .env
+notion.txt
 
 # Local setup
 wandb/
