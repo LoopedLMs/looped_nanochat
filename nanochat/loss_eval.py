@@ -6,6 +6,7 @@ import math
 
 import torch
 import torch.distributed as dist
+from tqdm import tqdm
 
 
 @torch.no_grad()
@@ -31,7 +32,9 @@ def evaluate_bpb(model, batches, steps, token_bytes, num_recur=None):
     total_nats = torch.tensor(0.0, dtype=torch.float32, device=model.get_device())
     total_bytes = torch.tensor(0, dtype=torch.int64, device=model.get_device())
     batch_iter = iter(batches)
-    for _ in range(steps):
+    is_rank0 = not dist.is_initialized() or dist.get_rank() == 0
+    pbar = tqdm(range(steps), desc="bpb", disable=not is_rank0)
+    for _ in pbar:
         x, y = next(batch_iter)
         loss2d = model(x, y, loss_reduction="none", num_recur=num_recur)  # (B, T)
         loss2d = loss2d.view(-1)  # flatten
@@ -50,6 +53,9 @@ def evaluate_bpb(model, batches, steps, token_bytes, num_recur=None):
             num_bytes2d = token_bytes[y]
             total_nats += (loss2d * (num_bytes2d > 0)).sum()
             total_bytes += num_bytes2d.sum()
+        if is_rank0 and total_bytes > 0:
+            running_bpb = total_nats.item() / (math.log(2) * total_bytes.item())
+            pbar.set_postfix(bpb=f"{running_bpb:.4f}")
     # sum reduce across all ranks
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     if world_size > 1:

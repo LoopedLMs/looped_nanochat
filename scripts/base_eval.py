@@ -39,7 +39,7 @@ from nanochat.checkpoint_manager import load_model
 from nanochat.common import autodetect_device_type, compute_cleanup, compute_init, download_file_with_lock, get_base_dir, print0
 from nanochat.core_eval import evaluate_task
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
-from nanochat.engine import Engine
+from nanochat.engine import Engine, KVCache
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.tokenizer import HuggingFaceTokenizer, get_token_bytes
 
@@ -65,6 +65,79 @@ class ModelWrapper:
 
     def get_device(self):
         return next(self.model.parameters()).device
+
+
+class TwoPassModelWrapper:
+    """
+    Two-pass inference wrapper for loop extrapolation experiments.
+
+    Pass 1: Full prefill with kv_budget=1 at base num_recur → frozen KV cache.
+    Pass 2: Token-by-token forward at pass2_num_recur. Each token sees only
+             pass 1's converged KV for past positions (restored after each step).
+    """
+
+    def __init__(self, model, pass2_num_recur: int | None = None):
+        self.model = model
+        self.pass2_num_recur = pass2_num_recur
+        self.max_seq_len = model.config.sequence_len
+        self.config = model.config
+
+    def get_device(self):
+        return self.model.get_device()
+
+    @torch.inference_mode()
+    def __call__(
+        self,
+        input_ids: torch.Tensor,
+        targets: torch.Tensor | None = None,
+        loss_reduction: str = "mean",
+        num_recur: int | None = None,
+    ):
+        pass1_num_recur = num_recur
+        pass2_num_recur = self.pass2_num_recur if self.pass2_num_recur is not None else pass1_num_recur
+        B, T = input_ids.shape
+        m = self.model.config
+
+        # Create KV cache with kv_budget=1 (only last recurrence stored)
+        effective_num_layers = m.n_prelude + m.n_recur_block + m.n_coda
+        resolved_num_recur = pass1_num_recur if pass1_num_recur is not None else int(m.train_recur_mean)
+        kv_cache = KVCache(
+            batch_size=B,
+            num_heads=m.n_kv_head,
+            seq_len=T,
+            head_dim=m.n_embd // m.n_head,
+            num_layers=effective_num_layers,
+            device=self.get_device(),
+            dtype=torch.bfloat16,
+            num_recur=resolved_num_recur,
+            kv_budget=1,
+        )
+
+        # Pass 1: full prefill, save frozen KV, discard logits
+        self.model(input_ids, kv_cache=kv_cache, num_recur=pass1_num_recur)
+        frozen_k = kv_cache.k_cache.clone()
+        frozen_v = kv_cache.v_cache.clone()
+
+        # Pass 2: token-by-token, restoring frozen KV after each step
+        all_logits = []
+        for t in range(T):
+            kv_cache.cache_seqlens.fill_(t)
+            logits_t, _ = self.model(input_ids[:, t : t + 1], kv_cache=kv_cache, num_recur=pass2_num_recur)
+            all_logits.append(logits_t)
+            # Restore position t from frozen copy so next token sees pass 1's KV
+            kv_cache.k_cache[:, :, t, :, :] = frozen_k[:, :, t, :, :]
+            kv_cache.v_cache[:, :, t, :, :] = frozen_v[:, :, t, :, :]
+
+        logits = torch.cat(all_logits, dim=1)  # (B, T, V)
+
+        if targets is not None:
+            return torch.nn.functional.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-1,
+                reduction=loss_reduction,
+            )
+        return logits, None
 
 
 def load_hf_model(hf_path: str, device):
@@ -192,6 +265,8 @@ def main():
     parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
     parser.add_argument("--num-recur", type=str, default=None, help="Comma-separated recurrence depths to evaluate, e.g. '2,4,6' (default = model's train_recur_mean)")
     parser.add_argument("--debug", type=int, default=0, help="Print this many debug examples per arithmetic task (0 = off)")
+    parser.add_argument("--two-pass", action="store_true", help="Two-pass inference: prefill for context, then token-by-token with restored KV")
+    parser.add_argument("--two-pass-recur", type=int, default=None, help="num_recur for pass 2 of two-pass mode (default = same as --num-recur)")
     args = parser.parse_args()
 
     # Parse evaluation modes
@@ -216,6 +291,12 @@ def main():
         model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=args.model_tag, step=args.step)
         sequence_len = meta["model_config"]["sequence_len"]
         token_bytes = get_token_bytes(device=device)
+
+    # Wrap model for two-pass inference if requested
+    unwrapped_model = model
+    if args.two_pass and not is_hf_model:
+        model = TwoPassModelWrapper(model, pass2_num_recur=args.two_pass_recur)
+        print0(f"Two-pass mode enabled (pass2_num_recur={args.two_pass_recur})")
 
     # Parse num_recur into a list of values to sweep
     if args.num_recur is not None:
@@ -378,7 +459,7 @@ def main():
                     "My favorite color is",
                     "If 5*x + 3 = 13, then x is",
                 ]
-                engine = Engine(model, tokenizer)
+                engine = Engine(unwrapped_model, tokenizer)
                 print0("\nConditioned samples:")
                 for prompt in prompts:
                     tokens = tokenizer(prompt, prepend="<|bos|>")
