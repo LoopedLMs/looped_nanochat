@@ -19,7 +19,7 @@ SIZES_FOR_3=(     14 16 18 20 22)
 N_PRELUDE=2
 N_RECUR_BLOCK=4
 N_CODA=2
-N_RECUR=2
+N_RECUR=4
 
 NPROC_PER_NODE=${NUM_GPUS:-1} # Number of processes/GPUs to use (from _machine_config.sh, defaults to 1)
 WANDB_RUN="${WANDB_RUN:-scaling_${LABEL}}"
