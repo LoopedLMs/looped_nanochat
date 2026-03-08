@@ -48,7 +48,7 @@ class GPTConfig:
     # Sliding window attention pattern string, tiled across layers. Final layer always L.
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
-    window_pattern: str = "LLSSSLLL"
+    window_pattern: str = "L"
 
     # Looped Transformer config options
     n_prelude: int = 2

@@ -8,11 +8,7 @@
       "Read(~/.aws/**)"
     ],
     "allow": [
-      "Bash(uv run ruff:*)",
-      "Bash(ls:*)",
-      "Bash(find:*)",
-      "Bash(grep:*)",
-      "Bash(cat:*)"
+      "Bash(uv run ruff:*)"
     ]
   }
 }

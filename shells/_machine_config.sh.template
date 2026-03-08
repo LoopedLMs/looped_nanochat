@@ -27,6 +27,7 @@ export SLURM_GPU_TYPE="${SLURM_GPU_TYPE:-}"    # Optional: GPU type constraint (
 export SLURM_GPU_MEM="${SLURM_GPU_MEM:-}"      # Optional: GPU memory per GPU (e.g., "20G"), leave empty if not supported
 export SLURM_MEM_GPU="64G"
 export SLURM_CPUS_GPU="${SLURM_CPUS_GPU:-16}"     # CPUs to request for GPU jobs
+export SLURM_TIME="${SLURM_TIME:-10:00:00}"      # Default time limit for all jobs
 export SLURM_MAIL_USER="your.email@example.com"
 
 # CPU Jobs (for data downloads, tokenizer training)

@@ -182,12 +182,7 @@ for arg in "${SBATCH_EXTRA_ARGS[@]}"; do
 done
 
 if [ "$TIME_SET" = false ]; then
-    if [ "$JOB_TYPE" = "cpu" ]; then
-        SBATCH_CMD="$SBATCH_CMD --time=01:00:00"
-    else
-        # Default to 10 hours for GPU jobs
-        SBATCH_CMD="$SBATCH_CMD --time=10:00:00"
-    fi
+    SBATCH_CMD="$SBATCH_CMD --time=${SLURM_TIME:-10:00:00}"
 fi
 
 # Add any additional user-provided sbatch overrides
