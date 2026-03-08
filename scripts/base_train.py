@@ -73,7 +73,7 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = si
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument(
-    "--window-pattern", type=str, default="LLSSSLLL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')"
+    "--window-pattern", type=str, default="L", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')"
 )
 # Looped Transformer config
 parser.add_argument("--n-prelude", type=int, default=2, help="number of prelude layers")

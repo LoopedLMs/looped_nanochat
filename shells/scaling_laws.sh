@@ -1,21 +1,25 @@
 #!/bin/bash
+set -eo pipefail
 
 LABEL="feb1"
 
-FLOPS_BUDGETS=(
-    1e18
-    2.15e18
-    4.64e18
-    1e19
+# Reference: size -> device batch size mapping (size * 64 = model_dim)
+declare -A SIZE_TO_BATCH=(
+    [6]=64 [8]=32 [10]=32 [12]=32 [14]=32 [16]=32
+    [18]=16 [20]=16 [24]=8  [28]=8
 )
-# Discrete model configs - fixed architecture, varying size (width = size * 64)
+
+# Per-budget size sweeps: SIZES_FOR_<budget_index>
 # Fixed architecture: 2 prelude + 4×4 recur + 2 coda = 20 effective layers
-SIZES=(            8  10  12  14  16  18  20)
-DEVICE_BATCH_SIZES=(128  64  64  32  32  32  32) 
+FLOPS_BUDGETS=(   1e18    2.15e18  4.64e18    1e19)
+SIZES_FOR_0=(     6 8 10 12 14)
+SIZES_FOR_1=(     8 10 12 14 16)
+SIZES_FOR_2=(     12 14 16 18 20)
+SIZES_FOR_3=(     14 16 18 20 22)
 N_PRELUDE=2
 N_RECUR_BLOCK=4
 N_CODA=2
-N_RECUR=4
+N_RECUR=2
 
 NPROC_PER_NODE=${NUM_GPUS:-1} # Number of processes/GPUs to use (from _machine_config.sh, defaults to 1)
 WANDB_RUN="${WANDB_RUN:-scaling_${LABEL}}"
@@ -55,14 +59,21 @@ run_exists() {
 # Main Loop
 # =============================================================================
 
-for flops in "${FLOPS_BUDGETS[@]}"; do
+for budget_idx in "${!FLOPS_BUDGETS[@]}"; do
+    flops="${FLOPS_BUDGETS[$budget_idx]}"
+    sizes_var="SIZES_FOR_${budget_idx}[@]"
+    sizes=("${!sizes_var}")
+
     log "=============================================="
-    log "Compute budget: $flops FLOPs"
+    log "Compute budget: $flops FLOPs (sizes: ${sizes[*]})"
     log "=============================================="
 
-    for i in "${!SIZES[@]}"; do
-        s="${SIZES[$i]}"
-        batch_size="${DEVICE_BATCH_SIZES[$i]}"
+    for s in "${sizes[@]}"; do
+        batch_size="${SIZE_TO_BATCH[$s]}"
+        if [ -z "$batch_size" ]; then
+            log "ERROR: No batch size defined for size=$s in SIZE_TO_BATCH"
+            exit 1
+        fi
 
         # Skip if already completed
         if run_exists "$flops" "$s"; then
@@ -93,7 +104,7 @@ for flops in "${FLOPS_BUDGETS[@]}"; do
             --core-metric-max-per-task=-1 \
             --sample-every=-1 \
             --save-every=-1 \
-            --window-pattern="LLSSSLLL" \
+            --window-pattern="L" \
             --train-recur-mean=$N_RECUR \
             --n-prelude=$N_PRELUDE \
             --n-recur-block=$N_RECUR_BLOCK \

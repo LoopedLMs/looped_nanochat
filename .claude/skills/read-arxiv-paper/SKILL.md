@@ -51,4 +51,6 @@ Remember that you're processing this paper within the context of a looped transf
 
 ## Part 7: Write the summary to Notion
 
-Read the project page id from `./notion.txt` and use the Notion MCP tool `notion-create-pages` to create an entry in the appropriate Paper Summaries database.
+Read the project page id from `./notion.txt`. If this file does not exist, use the Notion MCP tool `notion-search` to find the page by searching for "Looped Nanochat" under the "Loop Transformers → Experimentation" hierarchy, then extract the page ID from the search results.
+
+Use the Notion MCP tool `notion-create-pages` to create an entry in the appropriate Paper Summaries database.
