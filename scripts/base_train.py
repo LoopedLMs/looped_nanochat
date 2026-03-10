@@ -126,10 +126,10 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
-parser.add_argument("--save-before-warmdown", action="store_true", help="save a checkpoint right before warmdown begins")
+parser.add_argument("--save-before-warmdown", action=argparse.BooleanOptionalAction, default=False, help="save a checkpoint right before warmdown begins")
 parser.add_argument("--log-every", type=int, default=100, help="log detailed metrics to wandb every N steps")
 # Pre-packed data
-parser.add_argument("--prepacked-dir", type=str, default=None, help="directory with pre-packed Parquet shards (from pretokenize.py)")
+parser.add_argument("--prepacked", action=argparse.BooleanOptionalAction, default=True, help="use pre-packed data from NANOCHAT_BASE_DIR/prepacked_T<seq_len> (default: True)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 # Gradient tracking
@@ -408,18 +408,23 @@ if resuming:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-if args.prepacked_dir is not None:
+prepacked_dir = os.path.join(base_dir, f"prepacked_T{args.max_seq_len}")
+if args.prepacked:
+    assert os.path.isdir(prepacked_dir), (
+        f"Pre-packed data not found at {prepacked_dir}. "
+        f"Run 'python -m scripts.pretokenize' first or use --no-prepacked."
+    )
     resume_row_idx = 0
     if resuming and "row_idx" in (dataloader_resume_state_dict or {}):
         resume_row_idx = dataloader_resume_state_dict["row_idx"]
     train_loader = prepacked_data_loader(
-        args.prepacked_dir,
+        prepacked_dir,
         args.device_batch_size,
         args.max_seq_len,
         device=device,
         resume_row_idx=resume_row_idx,
     )
-    print0(f"Using pre-packed data from {args.prepacked_dir}")
+    print0(f"Using pre-packed data from {prepacked_dir}")
 else:
     train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
         tokenizer,

@@ -77,6 +77,7 @@ COMMON_FLAGS=(
     --matrix-lr=0.02
     --warmup-ratio=0.0
     --final-lr-frac=0.0
+    --prepacked
 )
 
 # Model tag used for checkpoints (all runs share the same checkpoint dir)
@@ -96,7 +97,7 @@ torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- 
     --save-before-warmdown \
     --save-every=-1 \
     --model-tag="$MODEL_TAG" \
-    --run="dummy" \
+    --run="${TAG}" \
     2>&1 | tee "$LOG_FILE"
 
 # Extract results for the initial ratio
@@ -125,7 +126,7 @@ for ratio in "${WARMDOWN_RATIOS[@]:1}"; do
         --resume-from-step=$WARMDOWN_ITERS \
         --save-every=-1 \
         --model-tag="$MODEL_TAG" \
-        --run="dummy" \
+        --run="${TAG}" \
         2>&1 | tee "$LOG_FILE"
 
     VAL_BPB=$(grep "Validation bpb:" "$LOG_FILE" | tail -1 | grep -oP '[\d.]+$')

@@ -127,6 +127,7 @@ for budget_idx in "${!FLOPS_BUDGETS[@]}"; do
             --warmup-ratio=0.0 \
             --warmdown-ratio=0.4 \
             --final-lr-frac=0.0 \
+            --prepacked \
             $OPTIONAL_FLAGS \
             2>&1 | tee "$RESULTS_DIR/${TAG}_train.log"
 
@@ -151,6 +152,10 @@ for budget_idx in "${!FLOPS_BUDGETS[@]}"; do
         NUM_ITERS=$(grep "Calculated number of iterations" "$LOG_FILE" | tail -1 | sed 's/.*: //' | tr -d ',')
         # Extract actual batch size from log (auto-computed by Power Lines, varies per model)
         TOTAL_BATCH=$(grep "Total batch size" "$LOG_FILE" | tail -1 | grep -oP 'Total batch size \K[\d,]+' | tr -d ',')
+        if [ -z "$NUM_ITERS" ] || [ -z "$TOTAL_BATCH" ]; then
+            log "ERROR: Could not extract NUM_ITERS or TOTAL_BATCH from $LOG_FILE"
+            exit 1
+        fi
         TOKENS_TRAINED=$((NUM_ITERS * TOTAL_BATCH))
         # Model dim
         MODEL_DIM=$((s * 64))
