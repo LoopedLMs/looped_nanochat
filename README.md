@@ -20,41 +20,56 @@ At each recurrence the prelude output is re-injected into the recurrent state vi
 ### Changes compared to Trelis
 - Sandwich norm + norm at end of recurrent block (see Huginn)
 - Trainable RMSNorm
-- Sliding window attention in recursive block (SSSL)
 - Random normal instead of duplicate prelude output for initial loop state (see Huginn)
 - Proper scaling laws to tune data:param ratio. 
   - Trelis increased data:param from 20 to 34, but we find looped LMs need less tokens per parameter (~10 D/N).
 
-**Planned experiments **
-- Value embeddings to increase attn capacity with little additional FLOPs (from current nanochat architecture)
-- STEM embeddings to increase MLP capacity with little additional FLOPs (arXiv:2601.10639)
-- Mamba layers instead of SWA to save FLOPs per loop (mainly good for long context though, which we don't have the compute for...)
+## SLURM Job Submission
 
-### Changes compared to Trelis
-- Sandwich norm + norm at end of recurrent block (arXiv:2502.05171)
-- Trainable RMSNorm (arXiv:2502.05171)
-- Sliding window attention (SWA) in recurrent block, saving compute (SSSL)
-- Random normal initialization for initial loop state instead of duplicating prelude output (arXiv:2502.05171)
-- Scaling law experiments show looped LMs need ~10 D/N tokens per parameter (vs. Trelis scaling from 20→34 D/N)
+All jobs are submitted through a single wrapper that reads cluster config from `shells/_machine_config.sh`:
 
-**Planned experiments (likely no significant impact at this scale)**
-- Value embeddings to increase attention capacity at minimal FLOPs (from current nanochat architecture)
-- STEM embeddings to increase MLP capacity at minimal FLOPs (arXiv:2601.10639)
-- Mamba layers instead of SWA for FLOPs efficiency (requires long context to show benefits)
+```bash
+# First-time setup
+cp shells/_machine_config.sh.template shells/_machine_config.sh
+# Edit with your cluster settings (partition, QoS, GPUs, etc.)
+
+# Submit any job
+./shells/_submit.sh shells/<script>.sh
+
+# Pass script arguments before --, sbatch overrides after --
+./shells/_submit.sh shells/scaling_laws.sh --smoke-test -- --time=24:00:00
+```
+
+Scripts ending with `_cpu.sh` are automatically routed to the CPU partition; all others go to GPU. Logs go to `logs/<script_name>/`.
 
 ## Training Pipeline
 
 | Stage | Script | Description |
 |-------|--------|-------------|
-| 1 | `base_train` | Next-token prediction on web text. Training budget set by param-data ratio (default 4×). CORE evaluated periodically. |
+| 1 | `base_train` | Next-token prediction on web text. CORE evaluated periodically. |
 | 2 | `chat_sft` | SFT on ~856K-row mixture: SmolTalk 460K, MMLU 100K, GSM8K 16K (×2ep), identity 2K (×2ep), SimpleSpelling 200K, SpellingBee 80K. Single epoch, bestfit-pad packing. |
 | 3 | `chat_rl` | Simplified GRPO on GSM8K. On-policy, no KL/trust region. Advantage = reward − mean(reward), DAPO-style token-level normalization. |
+
+## Pre-tokenization
+
+Pre-tokenize the dataset once so every training run skips tokenization. For close reproduction, download our pre-packed dataset and tokenizer directly from HuggingFace:
+
+```bash
+# Option A: Download pre-packed dataset from HuggingFace (recommended)
+uv run python -m scripts.pretokenize --download KristianS7/nanochat-prepacked-fineweb-edu
+
+# Option B: Build from scratch
+./shells/_submit.sh shells/preprocessing/download_dataset_cpu.sh  # download raw data
+./shells/_submit.sh shells/preprocessing/train_tokenizer_cpu.sh   # train tokenizer
+./shells/_submit.sh shells/preprocessing/pretokenize_cpu.sh       # pre-tokenize and pack
+
+# Use pre-packed data in training
+PREPACKED_DIR=$NANOCHAT_BASE_DIR/prepacked_T2048 ./shells/_submit.sh shells/scaling_laws.sh
+```
 
 ## Primary Metric: CORE
 
 22-task composite benchmark from the DCLM paper, spanning world knowledge, language understanding, commonsense reasoning, symbolic problem solving, and reading comprehension. Raw task accuracies are centered against random-guessing baselines and averaged into a single score.
-
-**Target: beat nanochat at CORE = 0.2565.**
 
 ## Original nanochat
 
@@ -123,7 +138,7 @@ For questions about the repo, I recommend either using [DeepWiki](https://deepwi
 
 ## Cite
 
-If you find nanochat helpful in your research cite simply as:
+If you find nanochat helpful in your research please cite the original repo:
 
 ```bibtex
 @misc{nanochat,

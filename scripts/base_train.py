@@ -490,6 +490,9 @@ else:
     )
     print0(f"Recomputed cumulative FLOPs up to step {step}: {cumulative_flops:e}")
 
+# Pre-warmdown checkpoint step (for --save-before-warmdown)
+warmdown_start_step = num_iterations - round(args.warmdown_ratio * num_iterations)
+
 # -----------------------------------------------------------------------------
 # Training loop
 while True:
@@ -565,7 +568,6 @@ while True:
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     # also save right before warmdown begins (for warmdown ratio sweeps)
-    warmdown_start_step = num_iterations - round(args.warmdown_ratio * num_iterations)
     save_before_warmdown = args.save_before_warmdown and step == warmdown_start_step and step > 0
     if last_step or save_before_warmdown or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
         if save_before_warmdown:

@@ -13,7 +13,7 @@ Usage:
 
 import argparse
 import json
-import os
+import random
 import time
 from pathlib import Path
 
@@ -125,7 +125,7 @@ def pretokenize(
 
     for pq_idx, filepath in enumerate(parquet_paths):
         pf = pq.ParquetFile(filepath)
-        shard_name = os.path.basename(filepath)
+        shard_name = Path(filepath).name
         t_shard = time.time()
 
         for rg_idx in range(pf.num_row_groups):
@@ -208,6 +208,13 @@ def pretokenize(
 
 def _write_shard(output_dir: Path, shard_idx: int, rows: list[list[int]], split: str):
     """Write a single Parquet shard."""
+    assert all(
+        max(row) <= 65535 for row in rows
+    ), "Token values exceed uint16 range (65535). Use a tokenizer with vocab_size <= 65536."
+    # Shuffle rows so batches get a random mix of packing patterns
+    # (without this, best-fit produces a systematic ordering: rows with
+    # few long docs first, rows with many short docs last)
+    random.shuffle(rows)
     # Store tokens as fixed-length lists of uint16
     table = pa.table({"tokens": pa.array(rows, type=pa.list_(pa.uint16()))})
     filename = f"{split}-{shard_idx:05d}.parquet"
@@ -215,8 +222,18 @@ def _write_shard(output_dir: Path, shard_idx: int, rows: list[list[int]], split:
 
 
 def push_to_hub(output_dir: Path, repo_id: str):
-    """Upload the pre-packed dataset to HuggingFace Hub."""
+    """Upload the pre-packed dataset and tokenizer to HuggingFace Hub.
+
+    Repo layout:
+        tokenizer/tokenizer.pkl  — tokenizer (small, downloadable separately)
+        train-*.parquet          — pre-packed training shards
+        meta.json                — dataset metadata
+    """
     from huggingface_hub import HfApi
+
+    # Save tokenizer into output_dir so it gets uploaded together
+    tokenizer = get_tokenizer()
+    tokenizer.save(str(output_dir / "tokenizer"))
 
     api = HfApi()
     api.create_repo(repo_id, repo_type="dataset", exist_ok=True)
@@ -228,14 +245,32 @@ def push_to_hub(output_dir: Path, repo_id: str):
     print(f"Uploaded to https://huggingface.co/datasets/{repo_id}")
 
 
-def download_from_hub(repo_id: str, local_dir: Path):
-    """Download a pre-packed dataset from HuggingFace Hub."""
+def download_from_hub(
+    repo_id: str,
+    local_dir: Path,
+    only: str | None = None,
+):
+    """Download a pre-packed dataset from HuggingFace Hub.
+
+    Args:
+        repo_id: HuggingFace dataset repo ID.
+        local_dir: Local directory to download into.
+        only: Optional filter — "tokenizer" for just the tokenizer,
+              "data" for just shards + meta, None for everything.
+    """
     from huggingface_hub import snapshot_download
+
+    allow_patterns = None
+    if only == "tokenizer":
+        allow_patterns = ["tokenizer/*"]
+    elif only == "data":
+        allow_patterns = ["*.parquet", "meta.json"]
 
     snapshot_download(
         repo_id=repo_id,
         repo_type="dataset",
         local_dir=str(local_dir),
+        allow_patterns=allow_patterns,
     )
     print(f"Downloaded to {local_dir}")
 
@@ -250,6 +285,8 @@ if __name__ == "__main__":
     parser.add_argument("--split", type=str, default="train", choices=["train", "val"], help="dataset split")
     parser.add_argument("--output-dir", type=str, default=None, help="output directory (default: NANOCHAT_BASE_DIR/prepacked_T<seq_len>)")
     parser.add_argument("--push-to-hub", type=str, default=None, help="HuggingFace repo ID to upload to (e.g. ORG/dataset-name)")
+    parser.add_argument("--download", type=str, default=None, help="HuggingFace repo ID to download from (e.g. ORG/dataset-name)")
+    parser.add_argument("--only", type=str, default=None, choices=["tokenizer", "data"], help="download only tokenizer or data (used with --download)")
     args = parser.parse_args()
 
     if args.output_dir is None:
@@ -258,15 +295,18 @@ if __name__ == "__main__":
     else:
         output_dir = Path(args.output_dir)
 
-    meta = pretokenize(
-        output_dir=output_dir,
-        seq_len=args.seq_len,
-        buffer_size=args.buffer_size,
-        rows_per_batch=args.rows_per_batch,
-        rows_per_shard=args.rows_per_shard,
-        max_shards=args.max_shards,
-        split=args.split,
-    )
+    if args.download:
+        download_from_hub(args.download, output_dir, only=args.only)
+    else:
+        meta = pretokenize(
+            output_dir=output_dir,
+            seq_len=args.seq_len,
+            buffer_size=args.buffer_size,
+            rows_per_batch=args.rows_per_batch,
+            rows_per_shard=args.rows_per_shard,
+            max_shards=args.max_shards,
+            split=args.split,
+        )
 
-    if args.push_to_hub:
-        push_to_hub(output_dir, args.push_to_hub)
+        if args.push_to_hub:
+            push_to_hub(output_dir, args.push_to_hub)

@@ -16,6 +16,9 @@ Fallback to the original if you have very limited data AND long documents:
 https://github.com/karpathy/nanochat/blob/3c3a3d7/nanochat/dataloader.py#L78-L117
 """
 
+import json
+from pathlib import Path
+
 import torch
 import pyarrow.parquet as pq
 
@@ -169,14 +172,10 @@ def tokenizing_distributed_data_loader_bos_bestfit(*args, **kwargs):
 # Pre-packed dataloader: reads pre-tokenized + pre-packed Parquet files
 # =============================================================================
 
-def _list_prepacked_shards(prepacked_dir: str, split: str = "train") -> list[str]:
+def _list_prepacked_shards(prepacked_dir: str, split: str = "train") -> list[Path]:
     """List pre-packed Parquet shard files in sorted order."""
-    import os
-    files = sorted([
-        os.path.join(prepacked_dir, f)
-        for f in os.listdir(prepacked_dir)
-        if f.startswith(f"{split}-") and f.endswith(".parquet")
-    ])
+    d = Path(prepacked_dir)
+    files = sorted(d.glob(f"{split}-*.parquet"))
     assert files, f"No {split}-*.parquet files found in {prepacked_dir}"
     return files
 
@@ -207,6 +206,15 @@ def prepacked_data_loader(
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     shard_paths = _list_prepacked_shards(prepacked_dir)
 
+    # Validate that pre-packed data matches expected sequence length
+    meta_path = Path(prepacked_dir) / "meta.json"
+    if meta_path.exists():
+        with open(meta_path) as f:
+            meta = json.load(f)
+        assert meta["row_capacity"] == T + 1, (
+            f"Pre-packed data has row_capacity={meta['row_capacity']} but T+1={T + 1}"
+        )
+
     use_cuda = device == "cuda"
     row_capacity = T + 1
 
@@ -220,7 +228,7 @@ def prepacked_data_loader(
 
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
 
-    global_row_idx = resume_row_idx
+    global_row_idx = 0
     epoch = 1
 
     while True:  # infinite iteration (multi-epoch)
@@ -229,6 +237,12 @@ def prepacked_data_loader(
             for rg_idx in range(pf.num_row_groups):
                 table = pf.read_row_group(rg_idx)
                 all_rows = table.column("tokens").to_pylist()
+
+                assert len(all_rows) >= ddp_world_size, (
+                    f"Row group {rg_idx} in {shard_path} has {len(all_rows)} rows "
+                    f"but ddp_world_size={ddp_world_size}. All row groups must have "
+                    f"at least as many rows as GPUs to prevent DDP hangs."
+                )
 
                 for row_in_rg in range(ddp_rank, len(all_rows), ddp_world_size):
                     # Skip rows until we reach the resume point
