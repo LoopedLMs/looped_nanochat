@@ -163,3 +163,93 @@ def tokenizing_distributed_data_loader_bos_bestfit(*args, **kwargs):
     """Helper that omits state_dict from yields."""
     for inputs, targets, state_dict in tokenizing_distributed_data_loader_with_state_bos_bestfit(*args, **kwargs):
         yield inputs, targets
+
+
+# =============================================================================
+# Pre-packed dataloader: reads pre-tokenized + pre-packed Parquet files
+# =============================================================================
+
+def _list_prepacked_shards(prepacked_dir: str, split: str = "train") -> list[str]:
+    """List pre-packed Parquet shard files in sorted order."""
+    import os
+    files = sorted([
+        os.path.join(prepacked_dir, f)
+        for f in os.listdir(prepacked_dir)
+        if f.startswith(f"{split}-") and f.endswith(".parquet")
+    ])
+    assert files, f"No {split}-*.parquet files found in {prepacked_dir}"
+    return files
+
+
+def prepacked_data_loader(
+    prepacked_dir: str,
+    B: int,
+    T: int,
+    device: str = "cuda",
+    resume_row_idx: int = 0,
+):
+    """
+    Dataloader that reads pre-packed Parquet files directly.
+
+    Each row in the Parquet files is a packed sequence of T+1 tokens, already
+    BOS-aligned and best-fit packed. This loader just reads rows and yields
+    (inputs, targets, state_dict) with zero data processing overhead.
+
+    DDP sharding: rank k reads every Nth row (N = world_size).
+
+    Args:
+        prepacked_dir: Directory containing pre-packed Parquet shards.
+        B: Batch size (rows per yield).
+        T: Sequence length (each row has T+1 tokens).
+        device: Target device for tensors.
+        resume_row_idx: Global row index to resume from.
+    """
+    ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
+    shard_paths = _list_prepacked_shards(prepacked_dir)
+
+    use_cuda = device == "cuda"
+    row_capacity = T + 1
+
+    # Pre-allocate buffers (same pattern as the tokenizing loader)
+    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda)
+    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device)
+    cpu_inputs = cpu_buffer[:B * T].view(B, T)
+    cpu_targets = cpu_buffer[B * T:].view(B, T)
+    inputs = gpu_buffer[:B * T].view(B, T)
+    targets = gpu_buffer[B * T:].view(B, T)
+
+    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
+
+    global_row_idx = resume_row_idx
+    epoch = 1
+
+    while True:  # infinite iteration (multi-epoch)
+        for shard_path in shard_paths:
+            pf = pq.ParquetFile(shard_path)
+            for rg_idx in range(pf.num_row_groups):
+                table = pf.read_row_group(rg_idx)
+                all_rows = table.column("tokens").to_pylist()
+
+                for row_in_rg in range(ddp_rank, len(all_rows), ddp_world_size):
+                    # Skip rows until we reach the resume point
+                    if global_row_idx < resume_row_idx:
+                        global_row_idx += ddp_world_size
+                        continue
+
+                    tokens = all_rows[row_in_rg]
+                    batch_pos = (global_row_idx // ddp_world_size) % B
+
+                    row_buffer[batch_pos, :len(tokens)] = torch.tensor(tokens, dtype=torch.long)
+
+                    if batch_pos == B - 1:
+                        # Full batch — copy to GPU
+                        cpu_inputs.copy_(row_buffer[:, :-1])
+                        cpu_targets.copy_(row_buffer[:, 1:])
+                        state_dict = {"row_idx": global_row_idx, "epoch": epoch}
+                        gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
+                        yield inputs, targets, state_dict
+
+                    global_row_idx += ddp_world_size
+
+        epoch += 1
+        # Don't reset global_row_idx — it keeps increasing for resume tracking

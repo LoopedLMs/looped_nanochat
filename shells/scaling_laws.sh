@@ -24,6 +24,7 @@ N_RECUR=4
 NPROC_PER_NODE=${NUM_GPUS:-1} # Number of processes/GPUs to use (from _machine_config.sh, defaults to 1)
 WANDB_RUN="${WANDB_RUN:-scaling_${LABEL}}"
 EVAL_TOKENS=$((100 * 524288))  # ~100M tokens for final eval (default is ~10M)
+PREPACKED_DIR="${PREPACKED_DIR:-}"  # optional: path to pre-packed data from pretokenize.py
 
 export OMP_NUM_THREADS=1 # disable CPU multi-threading for libraries that use OpenMP (NumPy, PyTorch CPU ops, etc.)
 
@@ -92,6 +93,12 @@ for budget_idx in "${!FLOPS_BUDGETS[@]}"; do
         # Train the model with fixed flops budget
         # The script will auto-calculate num_iterations to hit target_flops
         # CORE eval happens once at the end (999999 ensures only final step)
+        # Build optional flags
+        OPTIONAL_FLAGS=""
+        if [ -n "$PREPACKED_DIR" ]; then
+            OPTIONAL_FLAGS="$OPTIONAL_FLAGS --prepacked-dir=$PREPACKED_DIR"
+        fi
+
         torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- \
             --size=$s \
             --device-batch-size=$batch_size \
@@ -104,6 +111,7 @@ for budget_idx in "${!FLOPS_BUDGETS[@]}"; do
             --core-metric-max-per-task=-1 \
             --sample-every=-1 \
             --save-every=-1 \
+            --save-before-warmdown \
             --window-pattern="L" \
             --train-recur-mean=$N_RECUR \
             --n-prelude=$N_PRELUDE \
@@ -119,6 +127,7 @@ for budget_idx in "${!FLOPS_BUDGETS[@]}"; do
             --warmup-ratio=0.0 \
             --warmdown-ratio=0.4 \
             --final-lr-frac=0.0 \
+            $OPTIONAL_FLAGS \
             2>&1 | tee "$RESULTS_DIR/${TAG}_train.log"
 
         END_TIME=$(date +%s)
@@ -140,8 +149,9 @@ for budget_idx in "${!FLOPS_BUDGETS[@]}"; do
         PARAMS_EFFECTIVE=$(grep "Effective params\s*:" "$LOG_FILE" | tail -1 | grep -oP '[\d,]+' | tr -d ',')
 
         NUM_ITERS=$(grep "Calculated number of iterations" "$LOG_FILE" | tail -1 | sed 's/.*: //' | tr -d ',')
-        # Calculate tokens trained (iterations * batch_size, default 524288)
-        TOKENS_TRAINED=$((NUM_ITERS * 524288))
+        # Extract actual batch size from log (auto-computed by Power Lines, varies per model)
+        TOTAL_BATCH=$(grep "Total batch size" "$LOG_FILE" | tail -1 | grep -oP 'Total batch size \K[\d,]+' | tr -d ',')
+        TOKENS_TRAINED=$((NUM_ITERS * TOTAL_BATCH))
         # Model dim
         MODEL_DIM=$((s * 64))
         # Val BPB from final eval

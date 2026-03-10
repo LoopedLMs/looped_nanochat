@@ -42,6 +42,7 @@ from nanochat.common import (
     solve_iterations_for_target_flops,
 )
 from nanochat.dataloader import (
+    prepacked_data_loader,
     tokenizing_distributed_data_loader_bos_bestfit,
     tokenizing_distributed_data_loader_with_state_bos_bestfit,
 )
@@ -125,7 +126,10 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--save-before-warmdown", action="store_true", help="save a checkpoint right before warmdown begins")
 parser.add_argument("--log-every", type=int, default=100, help="log detailed metrics to wandb every N steps")
+# Pre-packed data
+parser.add_argument("--prepacked-dir", type=str, default=None, help="directory with pre-packed Parquet shards (from pretokenize.py)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 # Gradient tracking
@@ -404,14 +408,27 @@ if resuming:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
-    tokenizer,
-    args.device_batch_size,
-    args.max_seq_len,
-    split="train",
-    device=device,
-    resume_state_dict=dataloader_resume_state_dict,
-)
+if args.prepacked_dir is not None:
+    resume_row_idx = 0
+    if resuming and "row_idx" in (dataloader_resume_state_dict or {}):
+        resume_row_idx = dataloader_resume_state_dict["row_idx"]
+    train_loader = prepacked_data_loader(
+        args.prepacked_dir,
+        args.device_batch_size,
+        args.max_seq_len,
+        device=device,
+        resume_row_idx=resume_row_idx,
+    )
+    print0(f"Using pre-packed data from {args.prepacked_dir}")
+else:
+    train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
+        tokenizer,
+        args.device_batch_size,
+        args.max_seq_len,
+        split="train",
+        device=device,
+        resume_state_dict=dataloader_resume_state_dict,
+    )
 
 
 def build_val_loader():
@@ -547,7 +564,12 @@ while True:
         model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
-    if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+    # also save right before warmdown begins (for warmdown ratio sweeps)
+    warmdown_start_step = num_iterations - round(args.warmdown_ratio * num_iterations)
+    save_before_warmdown = args.save_before_warmdown and step == warmdown_start_step and step > 0
+    if last_step or save_before_warmdown or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+        if save_before_warmdown:
+            print0(f"Saving pre-warmdown checkpoint at step {step} (warmdown starts next step)")
         save_checkpoint(
             checkpoint_dir,
             step,
