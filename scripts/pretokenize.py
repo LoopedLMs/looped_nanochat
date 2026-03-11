@@ -143,7 +143,7 @@ def pretokenize(
     output_dir: Path,
     seq_len: int = 2048,
     buffer_size: int = 1000,
-    rows_per_shard: int = 10_000,
+    rows_per_shard: int = 15_000,
     max_shards: int = -1,
     tokenizer_threads: int = 8,
     tokenizer_batch_size: int = 128,
@@ -310,7 +310,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Pre-tokenize and pre-pack FineWeb-Edu for training")
     parser.add_argument("--seq-len", type=int, default=2048, help="sequence length T (default: 2048)")
     parser.add_argument("--buffer-size", type=int, default=1000, help="document buffer size for best-fit packing")
-    parser.add_argument("--rows-per-shard", type=int, default=10000, help="rows per output Parquet shard")
+    parser.add_argument("--rows-per-shard", type=int, default=15000, help="rows per output Parquet shard")
     parser.add_argument("--max-shards", type=int, default=-1, help="max input shards to process (-1 = all)")
     parser.add_argument("--split", type=str, default="train", choices=["train", "val"], help="dataset split")
     parser.add_argument("--output-dir", type=str, default=None, help="output directory (default: NANOCHAT_BASE_DIR/prepacked_T<seq_len>)")

@@ -9,6 +9,9 @@ set -eo pipefail
 #   ./shells/_submit.sh shells/pretokenize_cpu.sh -- --time=24:00:00
 #
 # Optional env vars:
+#   DOWNLOAD_HUB=       HuggingFace repo ID to download from
+#                        (default: KristianS7/nanochat-prepacked-fineweb-edu)
+#   ONLY=               Download only "tokenizer" or "data" (default: both)
 #   SEQ_LEN=2048        Sequence length T (default: 2048)
 #   MAX_SHARDS=-1       Limit input shards for quick testing (default: all)
 #   PUSH_TO_HUB=        HuggingFace repo ID to upload to (default: skip)
@@ -23,27 +26,25 @@ source .venv/bin/activate
 
 SEQ_LEN="${SEQ_LEN:-2048}"
 MAX_SHARDS="${MAX_SHARDS:--1}"
+DOWNLOAD_HUB="${DOWNLOAD_HUB:-KristianS7/nanochat-prepacked-fineweb-edu}"
 OUTPUT_DIR="$NANOCHAT_BASE_DIR/prepacked_T${SEQ_LEN}"
 
+# --- Download mode (default) ---
 echo "=============================================="
-echo "Pre-tokenizing dataset"
-echo "  Sequence length: $SEQ_LEN"
-echo "  Max shards:      $MAX_SHARDS"
-echo "  Output:          $OUTPUT_DIR"
+echo "Downloading pre-packed dataset from HuggingFace"
+echo "  Repo:   $DOWNLOAD_HUB"
+echo "  Output: $OUTPUT_DIR"
+if [ -n "$ONLY" ]; then
+    echo "  Only:   $ONLY"
+fi
 echo "=============================================="
 
-OPTIONAL_FLAGS=""
-if [ "$MAX_SHARDS" != "-1" ]; then
-    OPTIONAL_FLAGS="$OPTIONAL_FLAGS --max-shards=$MAX_SHARDS"
-fi
-if [ -n "$PUSH_TO_HUB" ]; then
-    OPTIONAL_FLAGS="$OPTIONAL_FLAGS --push-to-hub=$PUSH_TO_HUB"
+DOWNLOAD_FLAGS="--download=$DOWNLOAD_HUB --output-dir=$OUTPUT_DIR"
+if [ -n "$ONLY" ]; then
+    DOWNLOAD_FLAGS="$DOWNLOAD_FLAGS --only=$ONLY"
 fi
 
-python -m scripts.pretokenize \
-    --seq-len="$SEQ_LEN" \
-    --output-dir="$OUTPUT_DIR" \
-    $OPTIONAL_FLAGS
+python -u -m scripts.pretokenize $DOWNLOAD_FLAGS
 
 echo ""
 echo "Done! Output: $OUTPUT_DIR"

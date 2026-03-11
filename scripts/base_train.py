@@ -116,9 +116,12 @@ parser.add_argument("--adam-beta1", type=float, default=0.8, help="Adam beta1 fo
 parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 for embedding/unembedding")
 parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.4, help="ratio of iterations for LR warmdown")
+parser.add_argument("--warmdown-schedule", type=str, default="linear", choices=["linear", "1-sqrt"], help="warmdown LR schedule shape (1-sqrt decays faster initially)")
 parser.add_argument("--recur-warmup-ratio", type=float, default=0.0, help="ratio of iterations for recurrence curriculum warmup (-1.0 = auto: 1 - warmdown_ratio, 0.0 = disabled)")
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=str, default="-1", help="resume training from this step number or checkpoint alias, e.g. 'pre_warmdown' (-1 = disable)")
+parser.add_argument("--resume-checkpoint-dir", type=str, default="", help="override checkpoint dir for resume (for cross-budget reuse); saves still go to the current run's dir")
+parser.add_argument("--checkpoint-base-dir", type=str, default="", help="override base dir for checkpoints (default: {NANOCHAT_BASE_DIR}/base_checkpoints)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=20 * 524288, help="number of tokens to evaluate val loss on")
@@ -236,14 +239,16 @@ model.init_weights()  # All tensors get initialized
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"s{args.size}"  # e.g. s12
-checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
+checkpoint_base = args.checkpoint_base_dir if args.checkpoint_base_dir else os.path.join(base_dir, "base_checkpoints")
+checkpoint_dir = os.path.join(checkpoint_base, output_dirname)
 # Parse resume_from_step: int step number or string alias (e.g. "pre_warmdown")
 resume_from_step: int | str = int(args.resume_from_step) if args.resume_from_step.lstrip("-").isdigit() else args.resume_from_step
 resuming = resume_from_step != -1
 if resuming:
-    print0(f"Resuming optimization from step {resume_from_step}")
+    resume_dir = args.resume_checkpoint_dir if args.resume_checkpoint_dir else checkpoint_dir
+    print0(f"Resuming optimization from step {resume_from_step} (checkpoint dir: {resume_dir})")
     model_data, optimizer_data, meta_data = load_checkpoint(
-        checkpoint_dir,
+        resume_dir,
         resume_from_step,
         device,
         load_optimizer=True,
@@ -462,7 +467,9 @@ def get_lr_multiplier(it):
     elif it <= num_iterations - warmdown_iters:
         return 1.0
     else:
-        progress = (num_iterations - it) / warmdown_iters
+        progress = (num_iterations - it) / warmdown_iters  # 1→0
+        if args.warmdown_schedule == "1-sqrt":
+            progress = 1 - math.sqrt(1 - progress)
         return progress * 1.0 + (1 - progress) * args.final_lr_frac
 
 
