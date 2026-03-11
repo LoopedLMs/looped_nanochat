@@ -34,6 +34,13 @@ EVAL_TOKENS=$((100 * 524288))
 
 export OMP_NUM_THREADS=1
 
+#--- One GPU broken, but need to queue two ---
+NPROC_PER_NODE=1
+IFS=',' read -ra GPUS <<< "$CUDA_VISIBLE_DEVICES"
+CUDA_VISIBLE_DEVICES="${GPUS[1]}"
+echo "Using GPU: $CUDA_VISIBLE_DEVICES"
+#---
+
 cd ~/looped_nanochat
 
 source shells/_machine_config.sh
@@ -107,15 +114,11 @@ TRAIN_TIME=$(grep "Total training time:" "$LOG_FILE" | tail -1 | grep -oP '[\d.]
 echo "$INITIAL_RATIO,$NUM_ITERS,$VAL_BPB,$TRAIN_TIME" >> "$RESULTS_FILE"
 log "  warmdown=$INITIAL_RATIO: val_bpb=$VAL_BPB"
 
-# Find the pre-warmdown checkpoint step
-WARMDOWN_ITERS=$(python3 -c "print(round($NUM_ITERS * (1.0 - $INITIAL_RATIO)))")
-log "Pre-warmdown checkpoint at step $WARMDOWN_ITERS"
-
 # =============================================================================
 # Phase 2: Resume from pre-warmdown checkpoint with different warmdown ratios
 # =============================================================================
 for ratio in "${WARMDOWN_RATIOS[@]:1}"; do
-    log "Phase 2: Resuming with warmdown=$ratio from step $WARMDOWN_ITERS"
+    log "Phase 2: Resuming with warmdown=$ratio from pre_warmdown checkpoint"
 
     TAG="${LABEL}_wd${ratio}"
     LOG_FILE="$RESULTS_DIR/${TAG}_train.log"
@@ -123,7 +126,7 @@ for ratio in "${WARMDOWN_RATIOS[@]:1}"; do
     torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- \
         "${COMMON_FLAGS[@]}" \
         --warmdown-ratio=$ratio \
-        --resume-from-step=$WARMDOWN_ITERS \
+        --resume-from-step=pre_warmdown \
         --save-every=-1 \
         --model-tag="$MODEL_TAG" \
         --run="${TAG}" \

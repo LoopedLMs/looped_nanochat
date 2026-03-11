@@ -5,6 +5,9 @@ Produces ready-to-train Parquet files where each row is a BOS-aligned best-fit
 packed sequence of T+1 tokens. During training, the dataloader just reads rows
 directly — no tokenization or packing overhead.
 
+Packing matches the online dataloader exactly: the document buffer is kept
+topped-up to buffer_size before packing each row.
+
 Usage:
     uv run python -m scripts.pretokenize
     uv run python -m scripts.pretokenize --max-shards 10  # quick test with 10 shards
@@ -15,6 +18,7 @@ import argparse
 import json
 import random
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import pyarrow as pa
@@ -25,61 +29,120 @@ from nanochat.dataset import list_parquet_files
 from nanochat.tokenizer import get_tokenizer
 
 
-def pack_batch(doc_buffer: list[list[int]], row_capacity: int, rows_per_batch: int) -> list[list[int]]:
+def _tokenized_docs(
+    parquet_paths: list[str],
+    tokenizer,
+    bos_token: int,
+    tokenizer_batch_size: int,
+    tokenizer_threads: int,
+    stats: dict,
+) -> Iterator[list[int]]:
+    """Yield tokenized documents one at a time from parquet files."""
+    for pq_idx, filepath in enumerate(parquet_paths):
+        pf = pq.ParquetFile(filepath)
+        shard_name = Path(filepath).name
+        t_shard = time.time()
+
+        for rg_idx in range(pf.num_row_groups):
+            rg = pf.read_row_group(rg_idx)
+            texts = rg.column("text").to_pylist()
+
+            for i in range(0, len(texts), tokenizer_batch_size):
+                batch = texts[i : i + tokenizer_batch_size]
+                token_lists = tokenizer.encode(
+                    batch, prepend=bos_token, num_threads=tokenizer_threads
+                )
+                stats["total_docs"] += len(token_lists)
+                yield from token_lists
+
+        elapsed = time.time() - t_shard
+        total_elapsed = time.time() - stats["t_start"]
+        print(
+            f"[{pq_idx + 1}/{stats['num_input_shards']}] {shard_name}: "
+            f"{elapsed:.1f}s | "
+            f"docs: {stats['total_docs']:,} | "
+            f"rows: {stats['total_rows']:,} | "
+            f"shards written: {stats['shards_written']} | "
+            f"total: {total_elapsed:.0f}s"
+        )
+
+
+def _pack_row(doc_buffer: list[list[int]], row_capacity: int) -> list[int] | None:
     """
-    BOS-aligned best-fit pack documents from doc_buffer into fixed-length rows.
+    Pack a single row using best-fit algorithm (identical to online dataloader).
 
-    Same algorithm as nanochat/dataloader.py: for each row, find the largest doc
-    that fits entirely, repeat until nothing fits, then crop the shortest doc to
-    fill remaining space. Every row starts with BOS.
+    For each position: find the largest doc that fits entirely, repeat until
+    nothing fits, then crop the shortest doc to fill remaining space.
 
-    Args:
-        doc_buffer: Mutable list of tokenized documents (consumed in-place).
-        row_capacity: Number of tokens per row (T+1).
-        rows_per_batch: Number of rows to produce.
-
-    Returns:
-        List of packed token lists, each of length row_capacity.
+    Returns None if the buffer runs dry before the row is full (tail docs
+    that can't fill a complete row are left in doc_buffer).
     """
-    rows = []
-    for _ in range(rows_per_batch):
+    row: list[int] = []
+    pos = 0
+    while pos < row_capacity and doc_buffer:
+        remaining = row_capacity - pos
+
+        # Find largest doc that fits entirely
+        best_idx = -1
+        best_len = 0
+        for i, doc in enumerate(doc_buffer):
+            doc_len = len(doc)
+            if doc_len <= remaining and doc_len > best_len:
+                best_idx = i
+                best_len = doc_len
+
+        if best_idx >= 0:
+            doc = doc_buffer.pop(best_idx)
+            row.extend(doc)
+            pos += len(doc)
+        else:
+            # No doc fits — crop shortest to fill remaining space
+            shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
+            doc = doc_buffer.pop(shortest_idx)
+            row.extend(doc[:remaining])
+            pos += remaining
+
+    if len(row) != row_capacity:
+        return None
+    return row
+
+
+def _pack_rows(
+    doc_iter: Iterator[list[int]],
+    row_capacity: int,
+    buffer_size: int,
+) -> Iterator[list[int]]:
+    """
+    Yield packed rows, keeping the buffer topped-up before each row.
+
+    This matches the online dataloader behavior: the buffer is always near
+    buffer_size when searching for best-fit candidates, giving optimal packing.
+    """
+    doc_buffer: list[list[int]] = []
+    exhausted = False
+
+    def refill():
+        nonlocal exhausted
+        while len(doc_buffer) < buffer_size and not exhausted:
+            try:
+                doc_buffer.append(next(doc_iter))
+            except StopIteration:
+                exhausted = True
+
+    while True:
+        refill()
         if not doc_buffer:
             break
-        row = []
-        pos = 0
-        while pos < row_capacity and doc_buffer:
-            remaining = row_capacity - pos
-
-            # Find largest doc that fits entirely
-            best_idx = -1
-            best_len = 0
-            for i, doc in enumerate(doc_buffer):
-                doc_len = len(doc)
-                if doc_len <= remaining and doc_len > best_len:
-                    best_idx = i
-                    best_len = doc_len
-
-            if best_idx >= 0:
-                doc = doc_buffer.pop(best_idx)
-                row.extend(doc)
-                pos += len(doc)
-            else:
-                # No doc fits — crop shortest to fill remaining space
-                shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                doc = doc_buffer.pop(shortest_idx)
-                row.extend(doc[:remaining])
-                pos += remaining
-
-        assert len(row) == row_capacity, f"Row length {len(row)} != {row_capacity}"
-        rows.append(row)
-    return rows
+        row = _pack_row(doc_buffer, row_capacity)
+        if row is None:
+            break  # remaining docs can't fill a complete row
+        yield row
 
 
 def pretokenize(
     output_dir: Path,
     seq_len: int = 2048,
     buffer_size: int = 1000,
-    rows_per_batch: int = 256,
     rows_per_shard: int = 10_000,
     max_shards: int = -1,
     tokenizer_threads: int = 8,
@@ -93,7 +156,6 @@ def pretokenize(
         output_dir: Where to write output Parquet files.
         seq_len: Sequence length T (rows will have T+1 tokens for input/target offset).
         buffer_size: Document buffer size for best-fit packing.
-        rows_per_batch: Documents packed independently per batch (no cross-batch state).
         rows_per_shard: Rows per output Parquet shard file.
         max_shards: Stop after this many input shards (-1 = all).
         tokenizer_threads: Threads for tiktoken batch encoding.
@@ -114,70 +176,40 @@ def pretokenize(
     if max_shards > 0:
         parquet_paths = parquet_paths[:max_shards]
 
-    total_rows = 0
-    total_tokens_packed = 0
-    total_docs_tokenized = 0
+    # Shared stats dict — updated by _tokenized_docs, read by progress prints
+    stats = {
+        "total_docs": 0,
+        "total_rows": 0,
+        "shards_written": 0,
+        "num_input_shards": len(parquet_paths),
+        "t_start": time.time(),
+    }
+
+    doc_iter = _tokenized_docs(
+        parquet_paths, tokenizer, bos_token, tokenizer_batch_size, tokenizer_threads, stats
+    )
+    row_iter = _pack_rows(doc_iter, row_capacity, buffer_size)
+
     shard_idx = 0
     shard_rows: list[list[int]] = []
-    doc_buffer: list[list[int]] = []
 
-    t_start = time.time()
+    for row in row_iter:
+        shard_rows.append(row)
+        stats["total_rows"] += 1
 
-    for pq_idx, filepath in enumerate(parquet_paths):
-        pf = pq.ParquetFile(filepath)
-        shard_name = Path(filepath).name
-        t_shard = time.time()
+        if len(shard_rows) >= rows_per_shard:
+            _write_shard(output_dir, shard_idx, shard_rows[:rows_per_shard], split)
+            shard_rows = shard_rows[rows_per_shard:]
+            shard_idx += 1
+            stats["shards_written"] = shard_idx
 
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            texts = rg.column("text").to_pylist()
-
-            # Tokenize in batches
-            for i in range(0, len(texts), tokenizer_batch_size):
-                batch = texts[i : i + tokenizer_batch_size]
-                token_lists = tokenizer.encode(batch, prepend=bos_token, num_threads=tokenizer_threads)
-                doc_buffer.extend(token_lists)
-                total_docs_tokenized += len(token_lists)
-
-                # Pack whenever buffer is full enough
-                while len(doc_buffer) >= buffer_size:
-                    packed_rows = pack_batch(doc_buffer, row_capacity, rows_per_batch)
-                    if not packed_rows:
-                        break
-                    shard_rows.extend(packed_rows)
-                    total_rows += len(packed_rows)
-                    total_tokens_packed += len(packed_rows) * row_capacity
-
-                    # Write shard when full
-                    while len(shard_rows) >= rows_per_shard:
-                        _write_shard(output_dir, shard_idx, shard_rows[:rows_per_shard], split)
-                        shard_rows = shard_rows[rows_per_shard:]
-                        shard_idx += 1
-
-        elapsed = time.time() - t_shard
-        total_elapsed = time.time() - t_start
-        print(
-            f"[{pq_idx + 1}/{len(parquet_paths)}] {shard_name}: "
-            f"{elapsed:.1f}s | "
-            f"docs: {total_docs_tokenized:,} | "
-            f"rows: {total_rows:,} | "
-            f"shards written: {shard_idx} | "
-            f"total: {total_elapsed:.0f}s"
-        )
-
-    # Drain remaining docs in buffer
-    while doc_buffer:
-        packed_rows = pack_batch(doc_buffer, row_capacity, min(rows_per_batch, len(doc_buffer)))
-        if not packed_rows:
-            break
-        shard_rows.extend(packed_rows)
-        total_rows += len(packed_rows)
-        total_tokens_packed += len(packed_rows) * row_capacity
-
-    # Write final shard
+    # Write final partial shard
     if shard_rows:
         _write_shard(output_dir, shard_idx, shard_rows, split)
         shard_idx += 1
+
+    total_rows = stats["total_rows"]
+    total_tokens_packed = total_rows * row_capacity
 
     # Write metadata
     meta = {
@@ -188,9 +220,8 @@ def pretokenize(
         "row_capacity": row_capacity,
         "total_rows": total_rows,
         "total_tokens": total_tokens_packed,
-        "total_docs": total_docs_tokenized,
+        "total_docs": stats["total_docs"],
         "num_shards": shard_idx,
-        "rows_per_batch": rows_per_batch,
         "buffer_size": buffer_size,
         "split": split,
         "input_shards": len(parquet_paths),
@@ -199,7 +230,7 @@ def pretokenize(
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
 
-    total_elapsed = time.time() - t_start
+    total_elapsed = time.time() - stats["t_start"]
     print(f"\nDone! {total_rows:,} rows in {shard_idx} shards ({total_elapsed:.0f}s)")
     print(f"Total tokens: {total_tokens_packed:,} ({total_tokens_packed / 1e9:.2f}B)")
     print(f"Output: {output_dir}")
@@ -279,7 +310,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Pre-tokenize and pre-pack FineWeb-Edu for training")
     parser.add_argument("--seq-len", type=int, default=2048, help="sequence length T (default: 2048)")
     parser.add_argument("--buffer-size", type=int, default=1000, help="document buffer size for best-fit packing")
-    parser.add_argument("--rows-per-batch", type=int, default=256, help="rows packed per independent batch")
     parser.add_argument("--rows-per-shard", type=int, default=10000, help="rows per output Parquet shard")
     parser.add_argument("--max-shards", type=int, default=-1, help="max input shards to process (-1 = all)")
     parser.add_argument("--split", type=str, default="train", choices=["train", "val"], help="dataset split")
@@ -302,7 +332,6 @@ if __name__ == "__main__":
             output_dir=output_dir,
             seq_len=args.seq_len,
             buffer_size=args.buffer_size,
-            rows_per_batch=args.rows_per_batch,
             rows_per_shard=args.rows_per_shard,
             max_shards=args.max_shards,
             split=args.split,

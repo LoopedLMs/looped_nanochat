@@ -50,6 +50,34 @@ def _patch_missing_keys(model_data, model_config):
     pass
 
 
+def create_checkpoint_alias(checkpoint_dir: str, step: int, alias: str, rank: int = 0):
+    """Create symlinks aliasing a step checkpoint, e.g. model_pre_warmdown.pt -> model_001234.pt."""
+    pairs = [(f"model_{step:06d}.pt", f"model_{alias}.pt"),
+             (f"meta_{step:06d}.json", f"meta_{alias}.json")]
+    if rank == 0:
+        for target, link_name in pairs:
+            link_path = os.path.join(checkpoint_dir, link_name)
+            if os.path.lexists(link_path):
+                os.remove(link_path)
+            os.symlink(target, link_path)
+            logger.info(f"Created checkpoint alias: {link_name} -> {target}")
+    # Optimizer is per-rank
+    optim_target = f"optim_{step:06d}_rank{rank:d}.pt"
+    optim_link = f"optim_{alias}_rank{rank:d}.pt"
+    link_path = os.path.join(checkpoint_dir, optim_link)
+    if os.path.lexists(link_path):
+        os.remove(link_path)
+    os.symlink(optim_target, link_path)
+    logger.info(f"Created checkpoint alias: {optim_link} -> {optim_target}")
+
+
+def resolve_step(step: int | str) -> str:
+    """Return the file infix for a given step: zero-padded int or string alias."""
+    if isinstance(step, int):
+        return f"{step:06d}"
+    return step
+
+
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -70,17 +98,18 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
         logger.info(f"Saved optimizer state to: {optimizer_path}")
 
 
-def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
+def load_checkpoint(checkpoint_dir, step: int | str, device, load_optimizer=False, rank=0):
+    infix = resolve_step(step)
     # Load the model state
-    model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
+    model_path = os.path.join(checkpoint_dir, f"model_{infix}.pt")
     model_data = torch.load(model_path, map_location=device)
     # Load the optimizer state if requested
     optimizer_data = None
     if load_optimizer:
-        optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
+        optimizer_path = os.path.join(checkpoint_dir, f"optim_{infix}_rank{rank:d}.pt")
         optimizer_data = torch.load(optimizer_path, map_location=device)
     # Load the metadata
-    meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
+    meta_path = os.path.join(checkpoint_dir, f"meta_{infix}.json")
     with open(meta_path, encoding="utf-8") as f:
         meta_data = json.load(f)
     return model_data, optimizer_data, meta_data

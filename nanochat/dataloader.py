@@ -185,7 +185,7 @@ def prepacked_data_loader(
     B: int,
     T: int,
     device: str = "cuda",
-    resume_row_idx: int = 0,
+    resume_state: dict | None = None,
 ):
     """
     Dataloader that reads pre-packed Parquet files directly.
@@ -201,7 +201,7 @@ def prepacked_data_loader(
         B: Batch size (rows per yield).
         T: Sequence length (each row has T+1 tokens).
         device: Target device for tensors.
-        resume_row_idx: Global row index to resume from.
+        resume_state: State dict from a previous yield to resume from.
     """
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     shard_paths = _list_prepacked_shards(prepacked_dir)
@@ -228,13 +228,31 @@ def prepacked_data_loader(
 
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
 
-    global_row_idx = 0
+    # Resume state: skip directly to the right shard/row instead of scanning
+    resume_shard_idx = 0
+    resume_rg_idx = 0
+    resume_row_in_rg = 0
     epoch = 1
+    if resume_state and "shard_idx" in resume_state:
+        resume_shard_idx = resume_state["shard_idx"]
+        resume_rg_idx = resume_state["rg_idx"]
+        resume_row_in_rg = resume_state["row_in_rg"]
+        epoch = resume_state.get("epoch", 1)
+
+    # Start global_row_idx aligned to batch boundary so batch_pos starts at 0
+    resume_row_idx = (resume_state or {}).get("row_idx", 0)
+    global_row_idx = (resume_row_idx // (B * ddp_world_size)) * (B * ddp_world_size)
 
     while True:  # infinite iteration (multi-epoch)
-        for shard_path in shard_paths:
+        for shard_idx, shard_path in enumerate(shard_paths):
+            if shard_idx < resume_shard_idx:
+                continue
+
             pf = pq.ParquetFile(shard_path)
             for rg_idx in range(pf.num_row_groups):
+                if shard_idx == resume_shard_idx and rg_idx < resume_rg_idx:
+                    continue
+
                 table = pf.read_row_group(rg_idx)
                 all_rows = table.column("tokens").to_pylist()
 
@@ -244,12 +262,8 @@ def prepacked_data_loader(
                     f"at least as many rows as GPUs to prevent DDP hangs."
                 )
 
-                for row_in_rg in range(ddp_rank, len(all_rows), ddp_world_size):
-                    # Skip rows until we reach the resume point
-                    if global_row_idx < resume_row_idx:
-                        global_row_idx += ddp_world_size
-                        continue
-
+                start_row = resume_row_in_rg if (shard_idx == resume_shard_idx and rg_idx == resume_rg_idx) else ddp_rank
+                for row_in_rg in range(start_row, len(all_rows), ddp_world_size):
                     tokens = all_rows[row_in_rg]
                     batch_pos = (global_row_idx // ddp_world_size) % B
 
@@ -259,11 +273,20 @@ def prepacked_data_loader(
                         # Full batch — copy to GPU
                         cpu_inputs.copy_(row_buffer[:, :-1])
                         cpu_targets.copy_(row_buffer[:, 1:])
-                        state_dict = {"row_idx": global_row_idx, "epoch": epoch}
+                        state_dict = {
+                            "row_idx": global_row_idx,
+                            "shard_idx": shard_idx,
+                            "rg_idx": rg_idx,
+                            "row_in_rg": row_in_rg + ddp_world_size,
+                            "epoch": epoch,
+                        }
                         gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
                         yield inputs, targets, state_dict
 
                     global_row_idx += ddp_world_size
 
+        # Reset skip state for next epoch
+        resume_shard_idx = 0
+        resume_rg_idx = 0
+        resume_row_in_rg = 0
         epoch += 1
-        # Don't reset global_row_idx — it keeps increasing for resume tracking
