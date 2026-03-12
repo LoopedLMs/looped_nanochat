@@ -23,7 +23,7 @@ from contextlib import nullcontext
 import torch
 import wandb
 
-from nanochat.checkpoint_manager import load_checkpoint, save_checkpoint
+from nanochat.checkpoint_manager import create_checkpoint_alias, load_checkpoint, save_checkpoint
 from nanochat.common import (
     DummyWandb,
     autodetect_device_type,
@@ -42,6 +42,7 @@ from nanochat.common import (
     solve_iterations_for_target_flops,
 )
 from nanochat.dataloader import (
+    prepacked_data_loader,
     tokenizing_distributed_data_loader_bos_bestfit,
     tokenizing_distributed_data_loader_with_state_bos_bestfit,
 )
@@ -117,7 +118,9 @@ parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of it
 parser.add_argument("--warmdown-ratio", type=float, default=0.4, help="ratio of iterations for LR warmdown")
 parser.add_argument("--recur-warmup-ratio", type=float, default=0.0, help="ratio of iterations for recurrence curriculum warmup (-1.0 = auto: 1 - warmdown_ratio, 0.0 = disabled)")
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
-parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
+parser.add_argument("--resume-from-step", type=str, default="-1", help="resume training from this step number or checkpoint alias, e.g. 'pre_warmdown' (-1 = disable)")
+parser.add_argument("--resume-checkpoint-dir", type=str, default="", help="override checkpoint dir for resume (for cross-budget reuse); saves still go to the current run's dir")
+parser.add_argument("--checkpoint-base-dir", type=str, default="", help="override base dir for checkpoints (default: {NANOCHAT_BASE_DIR}/base_checkpoints)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=20 * 524288, help="number of tokens to evaluate val loss on")
@@ -125,7 +128,10 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--save-before-warmdown", action=argparse.BooleanOptionalAction, default=False, help="save a checkpoint right before warmdown begins")
 parser.add_argument("--log-every", type=int, default=100, help="log detailed metrics to wandb every N steps")
+# Pre-packed data
+parser.add_argument("--prepacked", action=argparse.BooleanOptionalAction, default=True, help="use pre-packed data from NANOCHAT_BASE_DIR/prepacked_T<seq_len> (default: True)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 # Gradient tracking
@@ -232,18 +238,26 @@ model.init_weights()  # All tensors get initialized
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"s{args.size}"  # e.g. s12
-checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
-resuming = args.resume_from_step != -1
+checkpoint_base = args.checkpoint_base_dir if args.checkpoint_base_dir else os.path.join(base_dir, "base_checkpoints")
+checkpoint_dir = os.path.join(checkpoint_base, output_dirname)
+# Parse resume_from_step: int step number or string alias (e.g. "pre_warmdown")
+resume_from_step: int | str = int(args.resume_from_step) if args.resume_from_step.lstrip("-").isdigit() else args.resume_from_step
+resuming = resume_from_step != -1
 if resuming:
-    print0(f"Resuming optimization from step {args.resume_from_step}")
+    resume_dir = args.resume_checkpoint_dir if args.resume_checkpoint_dir else checkpoint_dir
+    print0(f"Resuming optimization from step {resume_from_step} (checkpoint dir: {resume_dir})")
     model_data, optimizer_data, meta_data = load_checkpoint(
-        checkpoint_dir,
-        args.resume_from_step,
+        resume_dir,
+        resume_from_step,
         device,
         load_optimizer=True,
         rank=ddp_rank,
     )
     model.load_state_dict(model_data, strict=True, assign=True)
+    # Resolve alias to actual step number (needed for step comparisons later)
+    if isinstance(resume_from_step, str):
+        resume_from_step = meta_data["step"]
+        print0(f"Resolved checkpoint alias to step {resume_from_step}")
     del model_data  # free up this memory after the copy
 
 orig_model = (
@@ -404,14 +418,29 @@ if resuming:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
-    tokenizer,
-    args.device_batch_size,
-    args.max_seq_len,
-    split="train",
-    device=device,
-    resume_state_dict=dataloader_resume_state_dict,
-)
+prepacked_dir = os.path.join(base_dir, f"prepacked_T{args.max_seq_len}")
+if args.prepacked:
+    assert os.path.isdir(prepacked_dir), (
+        f"Pre-packed data not found at {prepacked_dir}. "
+        f"Run 'python -m scripts.pretokenize' first or use --no-prepacked."
+    )
+    train_loader = prepacked_data_loader(
+        prepacked_dir,
+        args.device_batch_size,
+        args.max_seq_len,
+        device=device,
+        resume_state=dataloader_resume_state_dict,
+    )
+    print0(f"Using pre-packed data from {prepacked_dir}")
+else:
+    train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
+        tokenizer,
+        args.device_batch_size,
+        args.max_seq_len,
+        split="train",
+        device=device,
+        resume_state_dict=dataloader_resume_state_dict,
+    )
 
 
 def build_val_loader():
@@ -419,6 +448,10 @@ def build_val_loader():
 
 
 x, y, dataloader_state_dict = next(train_loader)  # kick off load of the very first batch of data
+# For checkpointing: save the state from BEFORE the prefetch that produced x,y.
+# dataloader_state_dict is a continuation state (points PAST the yielded batch).
+# On resume we need to reproduce the batch in x, so we save the previous state.
+dataloader_checkpoint_state = dataloader_resume_state_dict
 
 # -----------------------------------------------------------------------------
 # Set up hyperparameter schedulers
@@ -433,7 +466,7 @@ def get_lr_multiplier(it):
     elif it <= num_iterations - warmdown_iters:
         return 1.0
     else:
-        progress = (num_iterations - it) / warmdown_iters
+        progress = (num_iterations - it) / warmdown_iters  # 1→0
         return progress * 1.0 + (1 - progress) * args.final_lr_frac
 
 
@@ -472,6 +505,9 @@ else:
         model_config.train_recur_mean, args.recur_warmup_ratio, total_batch_size,
     )
     print0(f"Recomputed cumulative FLOPs up to step {step}: {cumulative_flops:e}")
+
+# Pre-warmdown checkpoint step (for --save-before-warmdown)
+warmdown_start_step = num_iterations - round(args.warmdown_ratio * num_iterations)
 
 # -----------------------------------------------------------------------------
 # Training loop
@@ -547,7 +583,11 @@ while True:
         model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
-    if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+    # also save right before warmdown begins (for warmdown ratio sweeps)
+    save_before_warmdown = args.save_before_warmdown and step == warmdown_start_step and step > 0
+    if last_step or save_before_warmdown or (step > 0 and step != resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+        if save_before_warmdown:
+            print0(f"Saving pre-warmdown checkpoint at step {step} (warmdown starts next step)")
         save_checkpoint(
             checkpoint_dir,
             step,
@@ -560,7 +600,7 @@ while True:
                 "user_config": user_config,  # inputs to the training script
                 "device_batch_size": args.device_batch_size,
                 "max_seq_len": args.max_seq_len,
-                "dataloader_state_dict": dataloader_state_dict,
+                "dataloader_state_dict": dataloader_checkpoint_state,
                 "loop_state": {  # all loop state (other than step) so that we can resume training
                     "min_val_bpb": min_val_bpb,
                     "smooth_train_loss": smooth_train_loss,
@@ -569,6 +609,8 @@ while True:
             },
             rank=ddp_rank,
         )
+        if save_before_warmdown:
+            create_checkpoint_alias(checkpoint_dir, step, "pre_warmdown", rank=ddp_rank)
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
     if last_step:
@@ -609,6 +651,7 @@ while True:
         train_loss = loss.detach()  # for logging
         loss = loss / grad_accum_steps  # each .backward() is a grad sum => normalize loss here
         loss.backward()
+        dataloader_checkpoint_state = dataloader_state_dict  # save state before prefetch (for checkpoint resume)
         x, y, dataloader_state_dict = next(train_loader)  # prefetch the next batch while the GPU is busy with forward/backward
 
     # Compute model health statistics: gradients and parameters (after all backward passes complete)
@@ -689,7 +732,7 @@ while True:
 
     # state update
     cumulative_flops += current_flops_per_token * total_batch_size
-    first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
+    first_step_of_run = (step == 0) or (resuming and step == resume_from_step)
     step += 1
 
     # The garbage collector is sadly a little bit overactive and for some poorly understood reason,
