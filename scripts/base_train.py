@@ -116,7 +116,6 @@ parser.add_argument("--adam-beta1", type=float, default=0.8, help="Adam beta1 fo
 parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 for embedding/unembedding")
 parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.4, help="ratio of iterations for LR warmdown")
-parser.add_argument("--warmdown-schedule", type=str, default="linear", choices=["linear", "1-sqrt"], help="warmdown LR schedule shape (1-sqrt decays faster initially)")
 parser.add_argument("--recur-warmup-ratio", type=float, default=0.0, help="ratio of iterations for recurrence curriculum warmup (-1.0 = auto: 1 - warmdown_ratio, 0.0 = disabled)")
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=str, default="-1", help="resume training from this step number or checkpoint alias, e.g. 'pre_warmdown' (-1 = disable)")
@@ -468,8 +467,6 @@ def get_lr_multiplier(it):
         return 1.0
     else:
         progress = (num_iterations - it) / warmdown_iters  # 1→0
-        if args.warmdown_schedule == "1-sqrt":
-            progress = 1 - math.sqrt(1 - progress)
         return progress * 1.0 + (1 - progress) * args.final_lr_frac
 
 

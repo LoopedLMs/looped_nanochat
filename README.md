@@ -55,16 +55,8 @@ Scripts ending with `_cpu.sh` are automatically routed to the CPU partition; all
 Pre-tokenize the dataset once so every training run skips tokenization. For close reproduction, download our pre-packed dataset and tokenizer directly from HuggingFace:
 
 ```bash
-# Option A: Download pre-packed dataset from HuggingFace (recommended)
-uv run python -m scripts.pretokenize --download KristianS7/nanochat-prepacked-fineweb-edu
-
-# Option B: Build from scratch
-./shells/_submit.sh shells/preprocessing/download_dataset_cpu.sh  # download raw data
-./shells/_submit.sh shells/preprocessing/train_tokenizer_cpu.sh   # train tokenizer
-./shells/_submit.sh shells/preprocessing/pretokenize_cpu.sh       # pre-tokenize and pack
-
-# Use pre-packed data in training
-PREPACKED_DIR=$NANOCHAT_BASE_DIR/prepacked_T2048 ./shells/_submit.sh shells/scaling_laws.sh
+# Download pre-packed dataset from HuggingFace
+./shells/_submit.sh shells/preprocessing/pretokenize_cpu.sh
 ```
 
 ## Primary Metric: CORE
