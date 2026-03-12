@@ -257,14 +257,23 @@ def push_to_hub(output_dir: Path, repo_id: str):
 
     Repo layout:
         tokenizer/tokenizer.pkl  — tokenizer (small, downloadable separately)
+        tokenizer/token_bytes.pt — per-token byte counts (required for bpb eval)
         train-*.parquet          — pre-packed training shards
         meta.json                — dataset metadata
     """
+    import shutil
+
     from huggingface_hub import HfApi
+    from nanochat.common import get_base_dir
 
     # Save tokenizer into output_dir so it gets uploaded together
     tokenizer = get_tokenizer()
     tokenizer.save(str(output_dir / "tokenizer"))
+
+    # Also copy token_bytes.pt (not produced by tokenizer.save, but needed for bpb eval)
+    src = Path(get_base_dir()) / "tokenizer" / "token_bytes.pt"
+    if src.exists():
+        shutil.copy2(src, output_dir / "tokenizer" / "token_bytes.pt")
 
     api = HfApi()
     api.create_repo(repo_id, repo_type="dataset", exist_ok=True)
@@ -285,25 +294,74 @@ def download_from_hub(
 
     Args:
         repo_id: HuggingFace dataset repo ID.
-        local_dir: Local directory to download into.
+        local_dir: Local directory to download data shards into.
         only: Optional filter — "tokenizer" for just the tokenizer,
               "data" for just shards + meta, None for everything.
+
+    The tokenizer is always placed in $NANOCHAT_BASE_DIR/tokenizer/ (where
+    get_tokenizer() and get_token_bytes() expect it), regardless of local_dir.
     """
     from huggingface_hub import snapshot_download
 
-    allow_patterns = None
-    if only == "tokenizer":
-        allow_patterns = ["tokenizer/*"]
-    elif only == "data":
-        allow_patterns = ["*.parquet", "meta.json"]
+    tokenizer_dir = Path(get_base_dir()) / "tokenizer"
 
-    snapshot_download(
-        repo_id=repo_id,
-        repo_type="dataset",
-        local_dir=str(local_dir),
-        allow_patterns=allow_patterns,
-    )
-    print(f"Downloaded to {local_dir}")
+    def _check_tokenizer_absent():
+        existing = [f for f in tokenizer_dir.iterdir() if f.is_file()] if tokenizer_dir.exists() else []
+        if existing:
+            raise FileExistsError(
+                f"Tokenizer directory {tokenizer_dir} already contains files: "
+                f"{[f.name for f in existing]}. Delete it first to avoid a tokenizer mismatch."
+            )
+
+    def _check_data_absent():
+        existing = list(local_dir.glob("*.parquet")) if local_dir.exists() else []
+        if existing:
+            raise FileExistsError(
+                f"Data directory {local_dir} already contains {len(existing)} parquet shard(s). "
+                f"Delete it first to avoid mixing datasets."
+            )
+
+    def _download_tokenizer():
+        _check_tokenizer_absent()
+        tokenizer_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_download(
+            repo_id=repo_id,
+            repo_type="dataset",
+            local_dir=str(tokenizer_dir),
+            allow_patterns=["tokenizer/*"],
+        )
+        # snapshot_download preserves the repo subfolder structure, so files land in
+        # tokenizer_dir/tokenizer/ — move them up to tokenizer_dir/ directly.
+        subfolder = tokenizer_dir / "tokenizer"
+        if subfolder.is_dir():
+            for f in subfolder.iterdir():
+                f.rename(tokenizer_dir / f.name)
+            subfolder.rmdir()
+        print(f"Downloaded tokenizer to {tokenizer_dir}")
+
+    if only == "tokenizer":
+        _download_tokenizer()
+    elif only == "data":
+        _check_data_absent()
+        snapshot_download(
+            repo_id=repo_id,
+            repo_type="dataset",
+            local_dir=str(local_dir),
+            allow_patterns=["*.parquet", "meta.json"],
+        )
+        print(f"Downloaded data to {local_dir}")
+    else:
+        # Check both before downloading either — fail fast before any network I/O
+        _check_tokenizer_absent()
+        _check_data_absent()
+        snapshot_download(
+            repo_id=repo_id,
+            repo_type="dataset",
+            local_dir=str(local_dir),
+            allow_patterns=["*.parquet", "meta.json"],
+        )
+        print(f"Downloaded data to {local_dir}")
+        _download_tokenizer()
 
 
 if __name__ == "__main__":
