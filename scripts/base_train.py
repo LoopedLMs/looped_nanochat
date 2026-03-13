@@ -107,7 +107,7 @@ parser.add_argument(
 )
 # Optimization
 parser.add_argument("--device-batch-size", type=int, default=32, help="per-device batch size")
-parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens (-1 = auto-compute via Power Lines paper)")
+parser.add_argument("--total-batch-size", type=int, default=524288, help="total batch size in tokens")
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
 parser.add_argument("--weight-decay", type=float, default=0.2, help="cautious weight decay for the Muon optimizer (for weights)")
@@ -330,14 +330,9 @@ else:
 D_REF = (target_tokens / num_scaling_params) * ref_scaling_params
 print0(f"Reference training horizon (D_REF): {D_REF:,.0f} tokens")
 
-# 2) Auto-compute optimal batch size: Bopt ∝ D^0.383 (Power Lines paper)
+# 2) Batch size and number of iterations
 if args.num_iterations <= 0:
     total_batch_size = args.total_batch_size
-    if total_batch_size == -1:
-        batch_size_ratio = target_tokens / D_REF
-        predicted_batch_size = B_REF * batch_size_ratio ** 0.383
-        total_batch_size = 2 ** round(math.log2(predicted_batch_size))
-        print0(f"Auto-computed optimal batch size: {total_batch_size:,} tokens")
     if args.target_flops > 0 and args.recur_warmup_ratio > 0:
         # Precise: binary search for num_iterations accounting for curriculum FLOPs
         num_iterations = solve_iterations_for_target_flops(
