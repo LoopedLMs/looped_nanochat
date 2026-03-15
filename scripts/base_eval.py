@@ -30,6 +30,7 @@ import tempfile
 import time
 import zipfile
 from contextlib import nullcontext
+from pathlib import Path
 
 import torch
 import yaml
@@ -139,9 +140,12 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1, num_recur=None):
     # Evaluate each task
     results = {}
     centered_results = {}
+    task_groups = {}  # label -> group name (derived from dataset_uri directory)
     for task in tasks:
         start_time = time.time()
         label = task["label"]
+        group = task["dataset_uri"].split("/")[0]
+        task_groups[label] = group
         task_meta = {
             "task_type": task["icl_task_type"],
             "dataset_uri": task["dataset_uri"],
@@ -168,9 +172,84 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1, num_recur=None):
         elapsed = time.time() - start_time
         print0(f"accuracy: {accuracy:.4f} | centered: {centered_result:.4f} | time: {elapsed:.2f}s")
 
+    # Group averages (centered scores)
+    group_labels: dict[str, list[str]] = {}
+    for label, group in task_groups.items():
+        group_labels.setdefault(group, []).append(label)
+    group_results = {g: sum(centered_results[l] for l in labels) / len(labels)
+                     for g, labels in group_labels.items()}
+
     core_metric = sum(centered_results.values()) / len(centered_results)
-    out = {"results": results, "centered_results": centered_results, "core_metric": core_metric}
+    out = {"results": results, "centered_results": centered_results,
+           "group_results": group_results, "core_metric": core_metric}
     return out
+
+
+# -----------------------------------------------------------------------------
+# Saunshi evaluation
+
+
+SAUNSHI_BUNDLE_DIR = Path(get_base_dir()) / "saunshi_bundle"
+
+
+def evaluate_saunshi(model, tokenizer, device, max_per_task=-1, num_recur=None):
+    """
+    Evaluate a base model on the Saunshi math word problem benchmark.
+    Returns dict with results (per-task accuracy), group_results (per-group average),
+    and saunshi_metric (mean of group averages).
+    """
+    bundle_dir = SAUNSHI_BUNDLE_DIR
+    config_path = bundle_dir / "saunshi.yaml"
+    data_base_path = bundle_dir / "eval_data"
+
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"Saunshi bundle not found at {bundle_dir}. "
+            "Run: uv run python dev/eval_saunshi/prepare_saunshi_bundle.py"
+        )
+
+    with open(config_path, encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+    tasks = config["tasks"]
+
+    results = {}
+    for task in tasks:
+        start_time = time.time()
+        label = task["label"]
+        task_meta = {
+            "task_type": task["task_type"],
+            "dataset_uri": task["dataset_uri"],
+            "num_fewshot": task["num_fewshot"],
+            "continuation_delimiter": task.get("continuation_delimiter", " "),
+        }
+        print0(f"Evaluating: {label} ({task_meta['num_fewshot']}-shot, type: {task_meta['task_type']})... ", end="")
+
+        data_path = data_base_path / task_meta["dataset_uri"]
+        with open(data_path, encoding="utf-8") as f:
+            data = [json.loads(line.strip()) for line in f]
+
+        shuffle_rng = random.Random(1337)
+        shuffle_rng.shuffle(data)
+        if max_per_task > 0:
+            data = data[:max_per_task]
+
+        accuracy = evaluate_task(model, tokenizer, data, device, task_meta, num_recur=num_recur)
+        results[label] = accuracy
+        elapsed = time.time() - start_time
+        print0(f"accuracy: {accuracy:.4f} | time: {elapsed:.2f}s")
+
+    # Compute per-group averages
+    group_tasks: dict[str, list[str]] = {}
+    for task in tasks:
+        g = task.get("group", "ungrouped")
+        group_tasks.setdefault(g, []).append(task["label"])
+
+    group_results = {}
+    for group, labels in group_tasks.items():
+        group_results[group] = sum(results[l] for l in labels) / len(labels)
+
+    saunshi_metric = sum(group_results.values()) / len(group_results)
+    return {"results": results, "group_results": group_results, "saunshi_metric": saunshi_metric}
 
 
 # -----------------------------------------------------------------------------
@@ -195,7 +274,7 @@ def main():
 
     # Parse evaluation modes
     eval_modes = set(mode.strip() for mode in args.eval.split(","))
-    valid_modes = {"core", "bpb", "sample"}
+    valid_modes = {"core", "bpb", "sample", "saunshi"}
     invalid = eval_modes - valid_modes
     if invalid:
         parser.error(f"Invalid eval modes: {invalid}. Valid: {valid_modes}")
@@ -283,6 +362,7 @@ def main():
 
         # Results to log
         core_results = None
+        saunshi_results = None
         bpb_results = {}
 
         # --- CORE evaluation ---
@@ -292,7 +372,24 @@ def main():
             print0("=" * 80)
             with autocast_ctx:
                 core_results = evaluate_core(model, tokenizer, device, max_per_task=args.max_per_task, num_recur=num_recur)
-            print0(f"CORE metric: {core_results['core_metric']:.4f}")
+            print0("-" * 80)
+            for group, acc in core_results["group_results"].items():
+                print0(f"  {group:<30s} {acc:.4f}")
+            print0("-" * 80)
+            print0(f"  {'core_metric':<30s} {core_results['core_metric']:.4f}")
+
+        # --- Saunshi evaluation ---
+        if "saunshi" in eval_modes:
+            print0("\n" + "=" * 80)
+            print0("Saunshi Evaluation")
+            print0("=" * 80)
+            with autocast_ctx:
+                saunshi_results = evaluate_saunshi(model, tokenizer, device, max_per_task=args.max_per_task, num_recur=num_recur)
+            print0("-" * 80)
+            for group, acc in saunshi_results["group_results"].items():
+                print0(f"  {group:<30s} {acc:.4f}")
+            print0("-" * 80)
+            print0(f"  {'saunshi_metric':<30s} {saunshi_results['saunshi_metric']:.4f}")
 
         # --- BPB evaluation ---
         if "bpb" in eval_modes:
@@ -325,6 +422,15 @@ def main():
                 for label in core_results["centered_results"]:
                     columns.append(label)
                     values.append(f"{core_results['centered_results'][label]:.6f}")
+            if saunshi_results:
+                columns.append("saunshi_metric")
+                values.append(f"{saunshi_results['saunshi_metric']:.6f}")
+                for group, acc in saunshi_results["group_results"].items():
+                    columns.append(f"saunshi_{group}")
+                    values.append(f"{acc:.6f}")
+                for label, acc in saunshi_results["results"].items():
+                    columns.append(f"saunshi_{label}")
+                    values.append(f"{acc:.6f}")
             if bpb_results:
                 columns.append("train_bpb")
                 values.append(f"{bpb_results['train']:.6f}")
