@@ -701,6 +701,7 @@ class GPT(nn.Module):
         warm_start_mask=None,
         return_intermediate_logits: bool = False,
         return_intermediate_states: bool = False,
+        mtp_weights: list[float] | None = None,
     ):
         B, T = idx.size()
         if num_recur is None:
@@ -776,13 +777,21 @@ class GPT(nn.Module):
             kv_cache.advance(T)
 
         if targets is not None:
-            # training: given the targets, compute and return the loss
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
-                ignore_index=-1,
-                reduction=loss_reduction,
-            )
+            V = logits.size(-1)
+            if mtp_weights is None:
+                loss = F.cross_entropy(logits.view(-1, V), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            else:
+                # Multi-token prediction: depth d=0 is standard next-token loss, d>0 predicts d tokens ahead.
+                # Same lm_head and hidden state reused for all depths — zero extra parameters.
+                loss = sum(
+                    w * F.cross_entropy(
+                        logits[:, :-d if d else None].reshape(-1, V),
+                        targets[:, d:].reshape(-1),
+                        ignore_index=-1,
+                        reduction=loss_reduction,
+                    )
+                    for d, w in enumerate(mtp_weights)
+                )
             return loss
         elif return_intermediate_states:
             return logits, s, intermediate_logits, intermediate_states

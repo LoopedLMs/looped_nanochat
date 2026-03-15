@@ -132,6 +132,8 @@ parser.add_argument("--save-before-warmdown", action=argparse.BooleanOptionalAct
 parser.add_argument("--log-every", type=int, default=100, help="log detailed metrics to wandb every N steps")
 # Pre-packed data
 parser.add_argument("--prepacked", action=argparse.BooleanOptionalAction, default=True, help="use pre-packed data from NANOCHAT_BASE_DIR/prepacked_T<seq_len> (default: True)")
+# Multi-token prediction
+parser.add_argument("--mtp-weights", type=float, nargs="+", default=None, metavar="W", help="MTP loss weights per depth, d=0 first (e.g. --mtp-weights 1.0 0.1 for standard + 1-ahead)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 # Gradient tracking
@@ -642,7 +644,7 @@ while True:
         if num_recur is None:
             num_recur = int(current_recur_mean)
         with autocast_ctx:
-            loss = model(x, y, num_recur=num_recur)
+            loss = model(x, y, num_recur=num_recur, mtp_weights=args.mtp_weights)
         train_loss = loss.detach()  # for logging
         loss = loss / grad_accum_steps  # each .backward() is a grad sum => normalize loss here
         loss.backward()
