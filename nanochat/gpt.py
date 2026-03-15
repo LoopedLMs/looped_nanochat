@@ -701,7 +701,7 @@ class GPT(nn.Module):
         warm_start_mask=None,
         return_intermediate_logits: bool = False,
         return_intermediate_states: bool = False,
-        mtp_weights: list[float] | None = None,
+        mtp_weights: torch.Tensor | None = None,
     ):
         B, T = idx.size()
         if num_recur is None:
@@ -778,20 +778,26 @@ class GPT(nn.Module):
 
         if targets is not None:
             V = logits.size(-1)
-            if mtp_weights is None:
+            if mtp_weights is None or len(mtp_weights) == 1:
                 loss = F.cross_entropy(logits.view(-1, V), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
             else:
-                # Multi-token prediction: depth d=0 is standard next-token loss, d>0 predicts d tokens ahead.
+                # Batched MTP: CE = logsumexp(logits) - logit[target], shared logsumexp across all depths.
                 # Same lm_head and hidden state reused for all depths — zero extra parameters.
-                loss = sum(
-                    w * F.cross_entropy(
-                        logits[:, :-d if d else None].reshape(-1, V),
-                        targets[:, d:].reshape(-1),
-                        ignore_index=-1,
-                        reduction=loss_reduction,
-                    )
-                    for d, w in enumerate(mtp_weights)
-                )
+                w = mtp_weights / mtp_weights.sum()
+                n = w.shape[0]
+                L = T - n + 1                                              # valid positions (same window for all depths)
+                lp = logits[:, :L, :]                                      # (B, L, V)
+                lse = torch.logsumexp(lp, dim=-1)                          # (B, L) — computed once, shared across depths
+                tgt = targets.unfold(1, n, 1)                              # (B, L, n): tgt[b,t,d] = targets[b, t+d]
+                mask = tgt == -1                                            # (B, L, n)
+                gathered = lp.gather(2, tgt.clamp(min=0))                  # (B, L, n): logit at each target index
+                ce = lse.unsqueeze(-1) - gathered                          # (B, L, n): per-element CE values
+                ce = ce.masked_fill(mask, 0.0)
+                if loss_reduction == "mean":
+                    valid = (~mask).float().sum(dim=(0, 1)).clamp(min=1)   # (n,)
+                    loss = (ce.sum(dim=(0, 1)) / valid * w).sum()
+                else:  # "sum"
+                    loss = (ce.sum(dim=(0, 1)) * w).sum()
             return loss
         elif return_intermediate_states:
             return logits, s, intermediate_logits, intermediate_states

@@ -133,7 +133,8 @@ parser.add_argument("--log-every", type=int, default=100, help="log detailed met
 # Pre-packed data
 parser.add_argument("--prepacked", action=argparse.BooleanOptionalAction, default=True, help="use pre-packed data from NANOCHAT_BASE_DIR/prepacked_T<seq_len> (default: True)")
 # Multi-token prediction
-parser.add_argument("--mtp-weights", type=float, nargs="+", default=None, metavar="W", help="MTP loss weights per depth, d=0 first (e.g. --mtp-weights 1.0 0.1 for standard + 1-ahead)")
+parser.add_argument("--mtp-schedule", action="store_true", default=False, help="Anneal MTP weights from N-token to 1-token prediction over training")
+parser.add_argument("--mtp-schedule-weights", type=float, nargs="+", default=[1.0, 0.5, 0.25], metavar="W", help="Initial MTP weights at the start of training (default: 1.0 0.5 0.25). The schedule fades auxiliary depths to zero one by one, outermost first.")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 # Gradient tracking
@@ -454,6 +455,24 @@ dataloader_checkpoint_state = dataloader_resume_state_dict
 # Set up hyperparameter schedulers
 
 
+# MTP annealing schedule: fades auxiliary depths to zero one by one, outermost first.
+# With n initial weights there are n equal phases; in phase k the (n-1-k)-th weight
+# fades to zero, and the final phase is pure next-token prediction.
+def get_mtp_weights(step: int, schedule_weights: list[float]) -> list[float]:
+    n = len(schedule_weights)
+    if n == 1:
+        return [1.0]
+    p = step / num_iterations
+    phase = min(int(p * n), n - 1)
+    if phase == n - 1:
+        return [1.0]
+    alpha = 1.0 - (p * n - phase)          # fade factor within current phase (1→0)
+    fade_idx = n - 1 - phase
+    weights = list(schedule_weights[:fade_idx]) + [schedule_weights[fade_idx] * alpha]
+    s = sum(weights)
+    return [w / s for w in weights]
+
+
 # Learning rate scheduler
 def get_lr_multiplier(it):
     warmup_iters = round(args.warmup_ratio * num_iterations)
@@ -630,6 +649,9 @@ while True:
         device=device,
     )
 
+    _mtp_weights = get_mtp_weights(step, args.mtp_schedule_weights) if args.mtp_schedule else None
+    mtp_weights = torch.tensor(_mtp_weights, device=device, dtype=torch.float32) if _mtp_weights is not None else None
+
     for _micro_step in range(grad_accum_steps):
         # Get num_recur for this micro-step
         num_recur = get_num_recur_for_microstep(
@@ -644,7 +666,7 @@ while True:
         if num_recur is None:
             num_recur = int(current_recur_mean)
         with autocast_ctx:
-            loss = model(x, y, num_recur=num_recur, mtp_weights=args.mtp_weights)
+            loss = model(x, y, num_recur=num_recur, mtp_weights=mtp_weights)
         train_loss = loss.detach()  # for logging
         loss = loss / grad_accum_steps  # each .backward() is a grad sum => normalize loss here
         loss.backward()
@@ -719,6 +741,7 @@ while True:
             "train/epoch": epoch,
             "train/num_recur": logged_num_recur,
             "train/recur_mean_scheduled": current_recur_mean,
+            **({f"train/mtp_w{d}": w for d, w in enumerate(_mtp_weights)} if _mtp_weights is not None else {}),
             "lr/muon": effective_lr_muon,           # effective learning rate for Muon (matrix params)
             "lr/embed": effective_lr_embed,         # effective learning rate for embeddings
             "lr/unembed": effective_lr_unembed,     # effective learning rate for unembedding (lm_head)
